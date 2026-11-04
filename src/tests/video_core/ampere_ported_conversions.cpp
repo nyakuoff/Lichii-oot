@@ -177,7 +177,13 @@ TEST_CASE("Ampere ceiling F2I rejects non-NTZ, other widths and unknown modifier
     CHECK(absolute.instructions[1] == 0x0407fffffff7f9f9ULL);
     // Bit 63 is the scalar F2I negate modifier, supported by the Ocarina lowering.
     invalid[0].words[1] |= 1U << 31;
-    REQUIRE(static_cast<bool>(LowerToMaxwell(invalid)));
+    const auto negated_absolute = LowerToMaxwell(invalid);
+    REQUIRE(negated_absolute);
+    REQUIRE(negated_absolute.instructions.size() == absolute.instructions.size() + 1);
+    CHECK(negated_absolute.instructions[1] == 0x0407fffffff7f9f9ULL);
+    CHECK(negated_absolute.instructions[2] == 0x044800000007f9f9ULL);
+    invalid[0].words[1] |= 1U << 29;
+    REQUIRE_FALSE(LowerToMaxwell(invalid));
     invalid = code;
     invalid[0].words[3] |= 1;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
