@@ -2463,7 +2463,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             break;
         }
-        case 0xb63: case 0xf63: { // TLD4 (gather), 2D without depth compare; component at bits 87-88.
+        case 0xb63: case 0xf63: { // TLD4 (gather); component at bits 87-88.
             // 0xf63: the handle in a uniform register (bit 91), Maxwell TLD4.B with the handle in Rb.
             const bool bindless = opcode == 0xf63;
             const u32 handle = bindless ? uniform_register(insn.Bits(40, 6)) : 255;
@@ -2496,7 +2496,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             if ((insn.Bits(61, 3) != 1 && !array) || (insn.Bits(77, 1) && !per_tap) || insn.Bits(81, 3) != 7 ||
                 insn.Bits(59, 1) ||
-                (depth_compare && (bindless || array || half || per_tap || offsets)) ||
+                (depth_compare && (bindless || array || half || per_tap || offsets ||
+                                   !insn.Bits(60, 1) || insn.Bits(80, 1) || insn.Bits(91, 1) ||
+                                   (source_a != 255 && source_a + 2 > register_limit) ||
+                                   (source_b != 255 && source_b >= register_limit))) ||
                 (array && !bindless && (!insn.Bits(60, 1) ||
                            (insn.words[2] & ~0x058000ffU) != 0x001e0f00U ||
                            source_a + 2 > register_limit || source_b >= register_limit ||
