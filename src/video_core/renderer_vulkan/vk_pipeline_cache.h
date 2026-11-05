@@ -174,6 +174,8 @@ private:
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
     bool oot_visual_workaround{};
+    float oot_fog_scale{0.25f};
+    float oot_exposure_scale{0.65f};
     u64 visual_workaround_title{};
 
     GraphicsPipelineCacheKey graphics_key{};

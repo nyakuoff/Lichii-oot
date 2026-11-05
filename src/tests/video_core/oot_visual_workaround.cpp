@@ -115,3 +115,24 @@ TEST_CASE("OoT visual workaround fails closed when the matched scalar shape chan
     CHECK(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Fog, true) == 0);
     CHECK(f.block.size() == size);
 }
+
+TEST_CASE("OoT visual scales require complete finite nonnegative numbers",
+          "[video_core][oot_visual_workaround]") {
+    using Shader::Optimization::ParseOotVisualScale;
+    CHECK(ParseOotVisualScale("0.25") == 0.25f);
+    CHECK(ParseOotVisualScale("0") == 0.0f);
+    CHECK(ParseOotVisualScale("1e-1") == 0.1f);
+    for (const auto text : {"", " 0.25", "0.25 ", "0.25junk", "nan", "inf", "-0.5", "+0.5", "1e99"}) {
+        CHECK_FALSE(ParseOotVisualScale(text));
+    }
+}
+
+TEST_CASE("OoT visual workaround accepts experimental scales",
+          "[video_core][oot_visual_workaround]") {
+    Fixture f;
+    f.program.stage = Shader::Stage::Fragment;
+    const auto exposure = f.ir.GetFloatCbuf(f.ir.Imm32(3U), f.ir.Imm32(0x38U));
+    REQUIRE(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Final, true,
+                                                         0.5f, 0.125f) == 1);
+    CHECK(Evaluate(exposure) == 0.25f);
+}

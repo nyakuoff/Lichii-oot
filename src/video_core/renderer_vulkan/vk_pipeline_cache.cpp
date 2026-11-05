@@ -406,6 +406,24 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
+    if (oot_visual_workaround) {
+        const auto read_scale = [](const char* name, float fallback) {
+            if (const char* text = std::getenv(name)) {
+                if (const auto scale = Shader::Optimization::ParseOotVisualScale(text)) {
+                    return *scale;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Invalid {}='{}': expected a finite nonnegative number; using {}",
+                            name, text, fallback);
+            }
+            return fallback;
+        };
+        oot_fog_scale = read_scale("EDEN_NX2_OOT_FOG_SCALE", oot_fog_scale);
+        oot_exposure_scale = read_scale("EDEN_NX2_OOT_EXPOSURE_SCALE", oot_exposure_scale);
+        LOG_WARNING(Render_Vulkan,
+                    "TEMPORARY OoT visual workaround enabled: fog scale {}, exposure scale {}",
+                    oot_fog_scale, oot_exposure_scale);
+    }
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1167,7 +1185,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
                 programs[index], program_id != 0 ? program_id : visual_workaround_title,
                 key.unique_hashes[index],
-                oot_visual_workaround)) {
+                oot_visual_workaround, oot_fog_scale, oot_exposure_scale)) {
             LOG_WARNING(Render_Vulkan,
                         "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
                         key.unique_hashes[index], *edits);
@@ -1437,7 +1455,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
     if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
             program, program_id != 0 ? program_id : visual_workaround_title, key.unique_hash,
-            oot_visual_workaround)) {
+            oot_visual_workaround, oot_fog_scale, oot_exposure_scale)) {
         LOG_WARNING(Render_Vulkan,
                     "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
                     key.unique_hash, *edits);

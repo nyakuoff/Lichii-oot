@@ -2,7 +2,10 @@
 
 #pragma once
 
+#include <charconv>
+#include <cmath>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -11,9 +14,21 @@
 
 namespace Shader::Optimization {
 
+inline std::optional<float> ParseOotVisualScale(std::string_view text) {
+    float scale{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), scale);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(scale) ||
+        scale < 0.0f) {
+        return std::nullopt;
+    }
+    return scale;
+}
+
 // TEMPORARY opt-in visual workaround for Ocarina of Time, not an emulator fix.
 inline std::optional<size_t> ApplyOotVisualWorkaround(IR::Program& program, u64 title_id,
-                                                     u64 shader_hash, bool enabled) {
+                                                     u64 shader_hash, bool enabled,
+                                                     float fog_scale = 0.25f,
+                                                     float exposure_scale = 0.65f) {
     if (!enabled || title_id != 0x0400486024DEC000ULL) {
         return std::nullopt;
     }
@@ -65,7 +80,7 @@ inline std::optional<size_t> ApplyOotVisualWorkaround(IR::Program& program, u64 
         const auto original = block->PrependNewInst(insertion, *inst);
         IR::IREmitter ir{*block, insertion};
         const auto scaled = ir.FPMul(IR::F32{IR::Value{&*original}},
-                                     ir.Imm32(fog ? 0.25f : 0.65f));
+                                     ir.Imm32(fog ? fog_scale : exposure_scale));
         inst->ReplaceUsesWith(scaled);
     }
     return matches.size();

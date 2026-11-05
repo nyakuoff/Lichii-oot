@@ -9,6 +9,20 @@ Each edited shader logs `TEMPORARY OoT visual workaround: shader <hash>, <n> sca
 warning level. An edit count of 0 means the shader no longer has the expected shape and was left
 unchanged.
 
+For experiments, set `EDEN_NX2_OOT_FOG_SCALE` (default `0.25`) and/or
+`EDEN_NX2_OOT_EXPOSURE_SCALE` (default `0.65`). These accept complete finite nonnegative
+numbers only (no whitespace or trailing text); invalid values warn and use the default.
+The selected scales are logged once when the Vulkan pipeline cache is created with the
+workaround enabled. Restart the emulator after changing these variables.
+
+Existing disk caches do not need clearing: the emulator caches shader environments, not
+the edited IR, and both disk-load and runtime compilation pass through the same IR edit.
+The Vulkan driver cache receives the newly emitted SPIR-V, so it cannot bypass the edit
+or reuse a different scale's shader. No cache format or shader hash ABI is changed.
+These shader hashes are the lowered-code CityHash64 XOR `0x4f554e4345000002`, including
+the converted header and native address map, as used by frame dumps, pipeline keys and
+`reject_shaders` / `EDEN_NX2_REJECT_HASH`; they are not the native capture keys below.
+
 ## What it changes
 
 | Shader | Native key | Edit |

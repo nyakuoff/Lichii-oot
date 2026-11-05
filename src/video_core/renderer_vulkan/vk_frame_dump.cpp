@@ -469,11 +469,10 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
             buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
             buffer.gpu_modified, from_host ? "host" : "guest");
         if (!from_host) {
-            if (recorded_bytes + buffer.guest.size() > SIZE_CAP) {
+            if (written_bytes + pending_bytes + buffer.guest.size() > SIZE_CAP) {
                 truncated = true;
                 continue;
             }
-            recorded_bytes += buffer.guest.size();
             WriteBuffer(tags, buffer.guest);
             continue;
         }
@@ -616,11 +615,10 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
 }
 
 bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
-    if (recorded_bytes + size > SIZE_CAP) {
+    if (written_bytes + pending_bytes + size > SIZE_CAP) {
         truncated = true;
         return false;
     }
-    recorded_bytes += size;
     vk::Buffer buffer = memory_allocator.CreateBuffer(
         VkBufferCreateInfo{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
