@@ -247,9 +247,21 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                                            device_addr_end_aligned - device_addr_start_aligned);
     // Mark only data that the GPU wrote. A mark stays for the session and sends later GPU writes
     // in the range to a download at each fence.
+    // EDEN_NX2_PREFLUSH=0: keep trap-and-flush-on-read instead of marking the range, so a GPU
+    // write after a read queues no per-fence download. The mark is permanent, and Ocarina writes
+    // such a range ~190 times between reads, paying ~85 us of copying on every fence.
+    static const bool preflush = [] {
+        const char* value = std::getenv("EDEN_NX2_PREFLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
     if (!area->preemtive) {
-        memory_tracker.MarkRegionAsPreflushable(device_addr_start_aligned,
-                                                device_addr_end_aligned - device_addr_start_aligned);
+        if (preflush) {
+            memory_tracker.MarkRegionAsPreflushable(
+                device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
+        } else {
+            ArmReadTraps(device_addr_start_aligned,
+                         device_addr_end_aligned - device_addr_start_aligned);
+        }
     } else {
         // The core keeps this area and has no mark. The next GPU write here must arm the range
         // again, which ends the area and sets the trap.
