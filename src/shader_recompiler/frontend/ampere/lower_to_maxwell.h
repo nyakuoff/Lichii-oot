@@ -2525,7 +2525,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
                         op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
                         op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820 &&
-                        op != 0xab9 && op != 0x919)
+                        op != 0xab9 && op != 0x919 && op != 0x981 && op != 0x424)
                         return fail(scan, "native per-tap gather control-flow proof");
                 }
                 if (!terminal) return fail(index, "native per-tap gather terminal proof");
