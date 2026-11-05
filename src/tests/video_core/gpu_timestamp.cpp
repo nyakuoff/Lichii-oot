@@ -70,3 +70,49 @@ TEST_CASE("Maxwell retains its tick units and clock scaling", "[video_core][gpu_
         REQUIRE(Tegra::ReadGpuTimestamp(timing, false, Settings::GpuClock::Overclock) == ticks / 512);
     }
 }
+
+TEST_CASE("Ampere GPU clock settings select report duration divisors", "[video_core][gpu_timestamp]") {
+    CHECK(Tegra::AmpereGpuTimeDivisor(Settings::GpuClock::Normal) == 1);
+    CHECK(Tegra::AmpereGpuTimeDivisor(Settings::GpuClock::Boost) == 4);
+    CHECK(Tegra::AmpereGpuTimeDivisor(Settings::GpuClock::Overclock) == 8);
+}
+
+TEST_CASE("GPU time divisor shrinks durations since a present", "[video_core][gpu_timestamp]") {
+    constexpr u64 AnchorNs = 293'036'000'000'000;
+    constexpr u64 FrameNs = 50'000'000;
+    for (const u64 divisor : {u64{0}, u64{1}}) {
+        CAPTURE(divisor);
+        REQUIRE(Tegra::DivideSinceAnchor(AnchorNs + FrameNs, AnchorNs, divisor) == AnchorNs + FrameNs);
+    }
+    for (const auto clock : Clocks) {
+        const u64 divisor = Tegra::AmpereGpuTimeDivisor(clock);
+        const u64 begin = Tegra::DivideSinceAnchor(AnchorNs + 10'000'000, AnchorNs, divisor);
+        const u64 end = Tegra::DivideSinceAnchor(AnchorNs + FrameNs, AnchorNs, divisor);
+        CAPTURE(clock);
+        REQUIRE(end - begin == 40'000'000 / divisor);
+        REQUIRE(AnchorNs + FrameNs - end < FrameNs);
+        REQUIRE(Tegra::DivideSinceAnchor(AnchorNs - 1, AnchorNs, divisor) == AnchorNs - 1);
+        REQUIRE(Tegra::DivideSinceAnchor(AnchorNs, AnchorNs, divisor) == AnchorNs);
+        REQUIRE(Tegra::DivideSinceAnchor(AnchorNs, 0, divisor) == AnchorNs);
+    }
+}
+
+TEST_CASE("GPU time divisor stays monotonic when the anchor moves", "[video_core][gpu_timestamp]") {
+    constexpr u64 StartNs = 95'000'000'000;
+    constexpr u64 FrameNs = 33'333'333;
+    for (const auto clock : Clocks) {
+        u64 anchor = StartNs;
+        u64 last = 0;
+        for (u64 now = StartNs; now < StartNs + 10 * FrameNs; now += 1'000'000) {
+            if (now - anchor >= FrameNs) {
+                anchor = now;
+            }
+            const u64 stamp = Tegra::DivideSinceAnchor(now, anchor, Tegra::AmpereGpuTimeDivisor(clock));
+            CAPTURE(now, anchor, clock);
+            REQUIRE(stamp >= last);
+            REQUIRE(stamp <= now);
+            REQUIRE(now - stamp < FrameNs);
+            last = stamp;
+        }
+    }
+}
