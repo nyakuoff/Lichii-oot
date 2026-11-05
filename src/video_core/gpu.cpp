@@ -6,14 +6,10 @@
 
 #include <array>
 #include <atomic>
-#include <charconv>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <list>
 #include <memory>
-#include <optional>
-#include <string_view>
 #include <utility>
 
 #include "common/assert.h"
@@ -45,27 +41,6 @@
 #include "video_core/shader_notify.h"
 
 namespace Tegra {
-
-namespace {
-u64 GpuTimeDivisor(Settings::GpuClock clock) {
-    static const std::optional<u64> override = []() -> std::optional<u64> {
-        const char* value = std::getenv("EDEN_NX2_GPU_TIME_DIV");
-        if (!value) {
-            return std::nullopt;
-        }
-        const std::string_view text{value};
-        u64 divisor{};
-        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), divisor);
-        if (error != std::errc{} || end != text.data() + text.size() || divisor == 0) {
-            LOG_WARNING(HW_GPU, "Invalid EDEN_NX2_GPU_TIME_DIV '{}'; using GPU Clocks setting", text);
-            return std::nullopt;
-        }
-        LOG_INFO(HW_GPU, "EDEN_NX2_GPU_TIME_DIV: GPU durations since each present / {}", divisor);
-        return divisor;
-    }();
-    return override.value_or(AmpereGpuTimeDivisor(clock));
-}
-} // Anonymous namespace
 
 struct GPU::Impl {
     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
@@ -184,16 +159,11 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
-        const bool ampere = g_nx2_ampere.load(std::memory_order_relaxed);
-        const auto clock = Settings::values.gpu_clock.GetValue();
-        const u64 anchor = gpu_time_anchor.load(std::memory_order_relaxed);
-        const u64 ticks = ReadGpuTimestamp(system.CoreTiming(), ampere, clock);
-        return ampere ? DivideSinceAnchor(ticks, anchor, GpuTimeDivisor(clock)) : ticks;
+        return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
+                                Settings::values.gpu_clock.GetValue());
     }
 
     void RendererFrameEndNotify() {
-        gpu_time_anchor.store(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
-                              std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
     }
 
@@ -381,7 +351,6 @@ struct GPU::Impl {
 
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
-    std::atomic<u64> gpu_time_anchor{};
     u64 last_sync_fence{};
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;

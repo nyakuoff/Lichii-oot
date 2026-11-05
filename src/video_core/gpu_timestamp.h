@@ -24,24 +24,4 @@ template <typename Timing>
     }
 }
 
-[[nodiscard]] constexpr u64 AmpereGpuTimeDivisor(Settings::GpuClock clock) {
-    switch (clock) {
-    case Settings::GpuClock::Boost:
-        return 4;
-    case Settings::GpuClock::Overclock:
-        return 8;
-    default:
-        return 1;
-    }
-}
-
-/// Shorten report durations without moving them out of the driver/VI nanosecond clock domain.
-[[nodiscard]] constexpr u64 DivideSinceAnchor(u64 now, u64 anchor, u64 divisor) {
-    // There is no frame anchor before the first present.
-    if (anchor == 0 || divisor <= 1 || now <= anchor) {
-        return now;
-    }
-    return anchor + (now - anchor) / divisor;
-}
-
 } // namespace Tegra
