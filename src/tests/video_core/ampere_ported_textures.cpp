@@ -19,10 +19,6 @@ u64 Copy(u64 predicate, u32 target, u32 source) {
     return 0x5c98000000000000ULL | predicate | target | (15ULL << 39) | (u64{source} << 20);
 }
 
-u64 MoveImmediate(u64 predicate, u32 target, u32 value) {
-    return 0x0100000000000000ULL | predicate | target | (15ULL << 12) | (u64{value} << 20);
-}
-
 std::array<Instruction, 4> PerTapProgram(u32 packed = 0xff00ff00) {
     return {{
         {{0x00087802, packed, 0x00000f00, 0x000fe400}},
@@ -33,7 +29,7 @@ std::array<Instruction, 4> PerTapProgram(u32 packed = 0xff00ff00) {
 }
 } // namespace
 
-TEST_CASE("Ampere per-tap gathers pass proven constant offsets to Maxwell TLD4.PTP",
+TEST_CASE("Ampere per-tap gathers pass the guest offset pair to Maxwell TLD4.PTP",
           "[video_core][ampere][gather]") {
     for (const u32 guard : {1U, 7U, 9U}) {
         for (u32 component = 0; component < 4; ++component) {
@@ -46,12 +42,12 @@ TEST_CASE("Ampere per-tap gathers pass proven constant offsets to Maxwell TLD4.P
                 REQUIRE(lowered);
                 REQUIRE(lowered.required_texture_buffer == 14);
                 const u64 pred = u64{guard} << 16;
-                const std::array<u64, 9> expected{
-                    MoveImmediate(pred, 248, packed),
-                    MoveImmediate(pred, 249, 0x01000001),
+                // The offsets start in R8/R9 and are read in place; the gather then overwrites
+                // that pair with its second destination, so the copies come after it.
+                const std::array<u64, 7> expected{
                     Copy(pred, 250, 4),
                     Copy(pred, 251, 5),
-                    0xc800000000000000ULL | pred | 250 | (250ULL << 8) | (248ULL << 20) |
+                    0xc800000000000000ULL | pred | 250 | (250ULL << 8) | (8ULL << 20) |
                         (2ULL << 28) | (15ULL << 31) | (4ULL << 36) | (1ULL << 49) |
                         (7ULL << 51) | (2ULL << 54) | (u64{component} << 56),
                     Copy(pred, 10, 250),
@@ -80,7 +76,7 @@ TEST_CASE("Ampere depth-compare gathers use Maxwell TLD4 dc", "[video_core][ampe
     CHECK(((*tld4 >> 20) & 0xff) == 28);
 }
 
-TEST_CASE("Ampere per-tap gathers prove constants across unrelated arithmetic and gathers",
+TEST_CASE("Ampere per-tap gathers read the offset pair each gather defines",
           "[video_core][ampere][gather]") {
     const std::array<Instruction, 6> code{{
         {{0x00067802, 0x01ff0002, 0x00000f00, 0x000fe400}},
@@ -93,31 +89,20 @@ TEST_CASE("Ampere per-tap gathers prove constants across unrelated arithmetic an
     const auto lowered = LowerToMaxwell(code);
     INFO(lowered.error);
     REQUIRE(lowered);
-    auto clobber = code;
-    clobber[3].words[0] = 0x04067b63;
-    REQUIRE(LowerToMaxwell(clobber).error == "native per-tap gather offset clobber");
-    clobber = code;
-    clobber[3].words[2] = 0x041e0f06;
-    REQUIRE(LowerToMaxwell(clobber).error == "native per-tap gather offset clobber");
-    auto branch = code;
-    branch[2].words = {0x00007947, 0, 0x03800000, 0};
-    REQUIRE(LowerToMaxwell(branch).error == "native per-tap gather control-flow proof");
-}
-
-TEST_CASE("Ampere per-tap gathers reject unproven offsets and unsupported modes",
-          "[video_core][ampere][gather]") {
-    // The captured instruction alone has no visible offset definitions.
-    const auto alone = LowerToMaxwell(std::array{CapturedPerTapGather, Exit});
-    REQUIRE_FALSE(alone);
-    REQUIRE(alone.error == "native per-tap gather missing offsets");
-    // Offsets are signed 6-bit values, one per byte.
-    for (const u32 value : {32U, 127U, 128U, 223U}) {
-        for (u32 shift = 0; shift < 32; shift += 8) {
-            const auto lowered =
-                LowerToMaxwell(PerTapProgram((0xff00ff00U & ~(255U << shift)) | (value << shift)));
-            REQUIRE(lowered.error == "native per-tap gather offset range");
+    // The per-tap gather names the guest register pair that holds its offsets (R6/R7).
+    u32 meta = 0;
+    for (const u64 instruction : lowered.instructions) {
+        if (((instruction >> 56) & 0xfc) == 0xc8 && ((instruction >> 54) & 3) == 2) {
+            meta = static_cast<u32>((instruction >> 20) & 0xff);
         }
     }
+    CHECK(meta == 6);
+}
+
+TEST_CASE("Ampere per-tap gathers reject unsupported modes",
+          "[video_core][ampere][gather]") {
+    // A lone per-tap gather reads offsets the guest never wrote; it still lowers.
+    REQUIRE(static_cast<bool>(LowerToMaxwell(std::array{CapturedPerTapGather, Exit})));
     for (const u32 bit : {60U, 72U, 76U, 78U, 80U, 81U, 89U, 91U}) {
         auto invalid = PerTapProgram();
         invalid[2].words[bit / 32] ^= 1U << (bit % 32);
@@ -128,11 +113,8 @@ TEST_CASE("Ampere per-tap gathers reject unproven offsets and unsupported modes"
     half[2].words[2] |= 1U << 15; // Bit 79: an F16 per-tap gather.
     REQUIRE(static_cast<bool>(LowerToMaxwell(half)));
     auto invalid = PerTapProgram();
-    invalid[0].words[0] = 0x00081802; // predicated offset definition
-    REQUIRE(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
-    invalid = PerTapProgram();
-    invalid[1].words[0] = 0x000a7802; // R9 never defined
-    REQUIRE(LowerToMaxwell(invalid).error == "native per-tap gather missing offsets");
+    invalid[0].words[0] = 0x00081802; // predicated offset definition still lowers
+    REQUIRE(static_cast<bool>(LowerToMaxwell(invalid)));
     // Register pairs that would reach the lowering scratch registers.
     for (const u32 word : {0xf50a7b63U, 0x04f57b63U}) {
         invalid = PerTapProgram();
@@ -149,10 +131,11 @@ TEST_CASE("Ampere per-tap gathers reject unproven offsets and unsupported modes"
     invalid = PerTapProgram();
     invalid[2].words[0] = 0x040a7f63;
     REQUIRE_FALSE(LowerToMaxwell(invalid));
+    // Control flow around the gather is fine now that the offsets are read from registers.
     const Instruction branch{{0x00007947, 0, 0x03800000, 0}};
     const auto program = PerTapProgram();
-    REQUIRE_FALSE(LowerToMaxwell(std::array{branch, program[0], program[1], program[2], Exit}));
-    REQUIRE_FALSE(LowerToMaxwell(std::array{program[0], program[1], program[2], branch, Exit}));
+    REQUIRE(static_cast<bool>(
+        LowerToMaxwell(std::array{branch, program[0], program[1], program[2], Exit})));
 }
 
 TEST_CASE("Ampere gathers without per-tap offsets keep their previous lowering",

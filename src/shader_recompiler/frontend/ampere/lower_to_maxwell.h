@@ -101,11 +101,6 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         return result;
     };
     if (code.empty() || code.size() > 65536) return fail(0, "invalid native program size");
-    const bool relax_per_tap = std::getenv("EDEN_NX2_RELAX_PTP") != nullptr;
-    const auto is_control = [](u32 op) {
-        return (op & 0x1ff) >= 0x140 && (op & 0x1ff) <= 0x15f &&
-               op != 0x941 && op != 0x942 && op != 0x948 && op != 0x348 && op != 0x95b;
-    };
     std::optional<GeometryExitEnvelope> geometry_exit;
     if (code.front().Bits(0, 12) == 0x34e) {
         if (!geometry_stage) return fail(0, "native program counter load outside geometry stage");
@@ -2470,7 +2465,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // for TEX); Maxwell TLD4 takes it as AOFFI (bits 54-55) from Rb.
             const bool offsets = insn.Bits(76, 1) != 0;
             // Bits 76-77 = 2: per-tap offsets (PTP), x and y in Ra, Ra+1 and the packed offsets in
-            // Rb, Rb+1. The host gather needs them as constants, so they must be proven immediates.
+            // Rb, Rb+1.
             const bool per_tap = insn.Bits(76, 2) == 2;
             const bool depth_compare = insn.Bits(78, 1) != 0;
             const bool half = insn.Bits(79, 1) != 0;
@@ -2515,71 +2510,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     source_b + 1 >= register_limit || (dest != 255 && dest + 1 >= register_limit) ||
                     (second_dest != 255 && second_dest + 1 >= register_limit))
                     return fail(index, "native per-tap gather operands");
-                // The backward scan below is only sound for straight-line programs: every
-                // instruction up to the terminal EXIT must be one of these non-branching forms.
-                bool terminal = false;
-                for (u32 scan = 0; scan < code.size(); ++scan) {
-                    const auto& instruction = code[scan];
-                    if (instruction.Bits(12, 4) == 15) continue;
-                    const u32 op = instruction.Bits(0, 12);
-        uses_uniform_bank |= op == 0x83b && instruction.Bits(91, 1);
-                    if (op == 0x94d) {
-                        if (instruction.Bits(12, 4) == 7) {
-                            terminal = true;
-                            break;
-                        }
-                        if (!relax_per_tap)
-                            return fail(scan, "native per-tap gather control-flow proof");
-                        continue;
-                    }
-                    if (is_control(op) && !relax_per_tap)
-                        return fail(scan, "native per-tap gather control-flow proof");
-                }
-                if (!relax_per_tap && !terminal)
-                    return fail(index, "native per-tap gather terminal proof");
-                std::array<std::optional<u32>, 2> packed_offsets;
-                for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
-                    const auto& definition = code[--cursor];
-                    if (definition.Bits(12, 4) == 15) continue;
-                    const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
-                    if (is_control(op)) continue;
-                    if (op == 0xb63) {
-                        const u32 count = static_cast<u32>(std::popcount(definition.Bits(72, 4)));
-                        const u32 high = definition.Bits(64, 8);
-                        for (u32 i = 0; i < 2; ++i) {
-                            if (packed_offsets[i]) continue;
-                            const u32 reg = source_b + i;
-                            if ((target != 255 && reg >= target &&
-                                 reg < target + (high == 255 ? count : (std::min)(count, 2U))) ||
-                                (high != 255 && count > 2 && reg >= high && reg < high + count - 2))
-                                return fail(index, "native per-tap gather offset clobber");
-                        }
-                        continue;
-                    }
-                    for (u32 i = 0; i < 2; ++i) {
-                        if (packed_offsets[i] || target != source_b + i) continue;
-                        if (op == 0x424 && definition.Bits(24, 8) == 255 &&
-                            definition.Bits(64, 8) == 255 && definition.words[2] == 0x078e00ff) {
-                            packed_offsets[i] = definition.words[1];
-                            continue;
-                        }
-                        if (op != 0x802 || definition.Bits(12, 4) != 7 || definition.Bits(24, 8) ||
-                            definition.words[2] != 0x00000f00)
-                            return fail(cursor, "native per-tap gather nonconstant offsets");
-                        packed_offsets[i] = definition.words[1];
-                    }
-                }
-                for (const auto& packed : packed_offsets) {
-                    if (!packed) return fail(index, "native per-tap gather missing offsets");
-                    // Each byte is a signed 6-bit offset; the gather reads only the low six bits.
-                    for (u32 shift = 0; shift < 32; shift += 8) {
-                        const u32 value = (*packed >> shift) & 255;
-                        if (value > 31 && value < 224)
-                            return fail(index, "native per-tap gather offset range");
-                    }
-                }
-                for (u32 i = 0; i < packed_offsets.size(); ++i)
-                    mov_imm(248 + i, *packed_offsets[i]);
+                // Maxwell TLD4.PTP reads the same packed 6-bit offsets from Rb/Rb+1: four x
+                // offsets in Rb, then four y offsets in Rb+1. The guest pair is used as-is, so
+                // the offsets need not be constants (Ocarina loads them from shared memory).
             }
             if (!bindless) result.required_texture_buffer = binding;
             // Two coordinates: x in Ra, y in Rb (the coordinate list splits evenly across them);
@@ -2601,7 +2534,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
             } else {
             emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) |
-                 (u64{depth_compare ? source_b : per_tap ? 248U : offsets ? 246U : 255U} << 20) |
+                 (u64{depth_compare ? source_b : per_tap ? source_b : offsets ? 246U : 255U} << 20) |
                  (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) |
                  (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) |
                  (u64{depth_compare} << 50) | (u64{7} << 51) |

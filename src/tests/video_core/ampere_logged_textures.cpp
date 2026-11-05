@@ -291,11 +291,15 @@ TEST_CASE("Welcome Tour logged half gathers round and pack both destination orde
 
 TEST_CASE("Logged half textures retain unsupported-mode rejections",
           "[video_core][ampere][logged_textures]") {
-    for (const u32 bit : {76U, 77U, 78U, 80U, 91U}) {
+    for (const u32 bit : {76U, 78U, 80U, 91U}) {
         auto invalid{Gathers[0]};
         invalid.words[bit / 32] ^= 1U << (bit % 32);
         CHECK_FALSE(Shader::Ampere::LowerToMaxwell(std::array{invalid, Exit}));
     }
+    // Bit 77 selects the half per-tap form, which now lowers (Ocarina's compute gathers).
+    auto per_tap{Gathers[0]};
+    per_tap.words[2] ^= 1U << 13;
+    CHECK(static_cast<bool>(Shader::Ampere::LowerToMaxwell(std::array{per_tap, Exit})));
     auto invalid{Fetch};
     invalid.words[2] &= ~(1U << 15);
     CHECK_FALSE(Shader::Ampere::LowerToMaxwell(std::array{invalid, Exit}));
