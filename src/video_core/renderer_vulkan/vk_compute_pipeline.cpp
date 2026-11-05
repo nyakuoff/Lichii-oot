@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -429,6 +430,16 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         if (trace.armed && frame > trace.armed_frame && frame <= trace.armed_frame + trace.frames) {
             TraceUpscalerDispatch(trace, info, shader_hash, kepler_compute, gpu_memory,
                                   buffer_cache, texture_cache, views);
+        }
+    }
+
+    if (RecordingSampledTextures()) {
+        sampled_images.clear();
+        const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_buffer_descriptors);
+        for (size_t index = first; index < first + Shader::NumDescriptors(info.texture_descriptors);
+             ++index) {
+            sampled_images.push_back({views[index].index, views[index].id});
         }
     }
 
