@@ -490,7 +490,9 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         ctx.AddCapability(spv::Capability::DerivativeControl);
     }
     // TODO: Track this usage
-    ctx.AddCapability(spv::Capability::ImageGatherExtended);
+    if (profile.support_image_gather_extended) {
+        ctx.AddCapability(spv::Capability::ImageGatherExtended);
+    }
     ctx.AddCapability(spv::Capability::ImageQuery);
     ctx.AddCapability(spv::Capability::SampledBuffer);
     if (!ctx.non_uniform_ids.empty()) {

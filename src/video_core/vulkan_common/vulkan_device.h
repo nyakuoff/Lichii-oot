@@ -443,6 +443,18 @@ FN_MAX_LIMIT_LIST
         return features.features.geometryShader;
     }
 
+    bool IsImageGatherExtendedSupported() const {
+        return features.features.shaderImageGatherExtended;
+    }
+
+    s32 GetMinTexelGatherOffset() const {
+        return properties.properties.limits.minTexelGatherOffset;
+    }
+
+    s32 GetMaxTexelGatherOffset() const {
+        return static_cast<s32>(properties.properties.limits.maxTexelGatherOffset);
+    }
+
     /// Returns true if BCn is natively supported.
     bool IsOptimalBcnSupported() const {
         return features.features.textureCompressionBC;

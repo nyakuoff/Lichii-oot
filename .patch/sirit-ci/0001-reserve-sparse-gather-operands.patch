@@ -1,0 +1,21 @@
+diff --git a/src/instructions/image.cpp b/src/instructions/image.cpp
+--- a/src/instructions/image.cpp
++++ b/src/instructions/image.cpp
+@@ -138,7 +138,7 @@
+ Id Module::OpImageSparseGather(Id result_type, Id sampled_image, Id coordinate, Id component,
+                                std::optional<spv::ImageOperandsMask> image_operands,
+                                std::span<const Id> operands) {
+-    code->Reserve(6 + operands.size());
++    code->Reserve(6 + (image_operands.has_value() ? 1 : 0) + operands.size());
+     return *code << OpId{spv::Op::OpImageSparseGather, result_type} << sampled_image << coordinate
+                  << component << image_operands << operands << EndOp{};
+ }
+@@ -146,7 +146,7 @@
+ Id Module::OpImageSparseDrefGather(Id result_type, Id sampled_image, Id coordinate, Id dref,
+                                    std::optional<spv::ImageOperandsMask> image_operands,
+                                    std::span<const Id> operands) {
+-    code->Reserve(6 + operands.size());
++    code->Reserve(6 + (image_operands.has_value() ? 1 : 0) + operands.size());
+     return *code << OpId{spv::Op::OpImageSparseDrefGather, result_type} << sampled_image
+                  << coordinate << dref << image_operands << operands << EndOp{};
+ }

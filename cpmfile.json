@@ -278,6 +278,9 @@
         "options": [
             "SIRIT_USE_SYSTEM_SPIRV_HEADERS ON"
         ],
+        "patches": [
+            "0001-reserve-sparse-gather-operands.patch"
+        ],
         "repo": "eden-emulator/sirit",
         "version": "v1.0.5"
     },
@@ -285,6 +288,9 @@
         "ci": true,
         "name": "sirit",
         "package": "sirit",
+        "patches": [
+            "0001-reserve-sparse-gather-operands.patch"
+        ],
         "repo": "eden-emulator/sirit",
         "version": "v1.0.7"
     },

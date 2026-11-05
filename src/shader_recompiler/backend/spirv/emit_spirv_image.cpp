@@ -362,6 +362,78 @@ Id Emit(MethodPtrType sparse_ptr, MethodPtrType non_sparse_ptr, EmitContext& ctx
     return ctx.OpCompositeExtract(result_type, sample, 1U);
 }
 
+bool NeedsRuntimePtp(const IR::Value& offset, const IR::Value& offset2) {
+    return !offset2.IsEmpty() &&
+           (!offset.InstRecursive()->AreAllArgsImmediates() ||
+            !offset2.InstRecursive()->AreAllArgsImmediates());
+}
+
+template <typename MethodPtrType>
+Id EmitRuntimePtp(MethodPtrType sparse_ptr, MethodPtrType non_sparse_ptr, EmitContext& ctx,
+                  IR::Inst* inst, Id result_type, Id scalar_type, Id texture, Id coords,
+                  Id component_or_dref, const IR::Value& offset, const IR::Value& offset2) {
+    const std::array vectors{ctx.Def(offset), ctx.Def(offset2)};
+    IR::Inst* const sparse{inst->GetAssociatedPseudoOperation(IR::Opcode::GetSparseFromOp)};
+    const Id struct_type{sparse ? ctx.TypeStruct(ctx.U32[1], result_type) : Id{}};
+    const bool limited_offsets = ctx.profile.min_texel_gather_offset > -32 ||
+                                 ctx.profile.max_texel_gather_offset < 31;
+    if (limited_offsets) {
+        LOG_WARNING(Shader_SPIRV,
+                    "PTP offset range [{}, {}] is smaller than the guest range [-32, 31]; "
+                    "out-of-range taps will ignore their offsets",
+                    ctx.profile.min_texel_gather_offset, ctx.profile.max_texel_gather_offset);
+    }
+    Id resident{};
+    std::array<Id, 4> texels;
+    for (u32 tap = 0; tap < texels.size(); ++tap) {
+        const Id vector{vectors[tap / 2]};
+        const u32 lane = (tap % 2) * 2;
+        const Id pair{ctx.OpVectorShuffle(ctx.U32[2], vector, vector, lane, lane + 1)};
+        Id signed_pair{ctx.OpBitcast(ctx.S32[2], pair)};
+        Id in_range{};
+        if (limited_offsets) {
+            for (u32 axis = 0; axis < 2; ++axis) {
+                const Id value{ctx.OpCompositeExtract(ctx.S32[1], signed_pair, axis)};
+                const Id lower{ctx.OpSGreaterThanEqual(
+                    ctx.U1, value, ctx.SConst(ctx.profile.min_texel_gather_offset))};
+                const Id upper{ctx.OpSLessThanEqual(
+                    ctx.U1, value, ctx.SConst(ctx.profile.max_texel_gather_offset))};
+                const Id valid{ctx.OpLogicalAnd(ctx.U1, lower, upper)};
+                in_range = axis == 0 ? valid : ctx.OpLogicalAnd(ctx.U1, in_range, valid);
+            }
+            const Id valid_pair{ctx.OpCompositeConstruct(ctx.TypeVector(ctx.U1, 2), in_range, in_range)};
+            signed_pair = ctx.OpSelect(ctx.S32[2], valid_pair, signed_pair, ctx.SConst(0, 0));
+        }
+        const std::array operands{signed_pair};
+        Id color;
+        if (sparse) {
+            const Id sample{(ctx.*sparse_ptr)(struct_type, texture, coords, component_or_dref,
+                                             spv::ImageOperandsMask::Offset, operands)};
+            const Id code{ctx.OpCompositeExtract(ctx.U32[1], sample, 0U)};
+            const Id tap_resident{ctx.OpImageSparseTexelsResident(ctx.U1, code)};
+            resident = tap == 0 ? tap_resident : ctx.OpLogicalAnd(ctx.U1, resident, tap_resident);
+            color = ctx.OpCompositeExtract(result_type, sample, 1U);
+        } else {
+            color = (ctx.*non_sparse_ptr)(result_type, texture, coords, component_or_dref,
+                                          spv::ImageOperandsMask::Offset, operands);
+        }
+        Decorate(ctx, inst, color);
+        // ConstOffsets addresses every tap relative to i0,j0. A single-offset gather puts
+        // that texel in .w (not component tap), preserving the existing PTP ordering.
+        texels[tap] = ctx.OpCompositeExtract(scalar_type, color, 3U);
+        if (limited_offsets) {
+            // Preserve the old no-offset result only for taps the host cannot represent.
+            texels[tap] = ctx.OpSelect(scalar_type, in_range, texels[tap],
+                                      ctx.OpCompositeExtract(scalar_type, color, tap));
+        }
+    }
+    if (sparse) {
+        sparse->SetDefinition(resident);
+        sparse->Invalidate();
+    }
+    return ctx.OpCompositeConstruct(result_type, texels);
+}
+
 Id IsScaled(EmitContext& ctx, const IR::Value& index, Id member_index, u32 base_index) {
     const Id push_constant_u32{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
     Id bit{};
@@ -633,10 +705,17 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id 
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
-    const ImageOperands operands(ctx, offset, offset2);
     if (ctx.profile.need_gather_subpixel_offset) {
         coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
     }
+    if (ctx.profile.support_image_gather_extended && NeedsRuntimePtp(offset, offset2)) {
+        const Id color{EmitRuntimePtp(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather,
+                                     ctx, inst, result_type, is_integer ? ctx.U32[1] : ctx.F32[1],
+                                     Texture(ctx, info, index), coords, ctx.Const(info.gather_component),
+                                     offset, offset2)};
+        return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
+    }
+    const ImageOperands operands(ctx, offset, offset2);
     const Id color{Emit(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather, ctx, inst,
                         result_type, Texture(ctx, info, index), coords,
                         ctx.Const(info.gather_component), operands.MaskOptional(),
@@ -649,10 +728,17 @@ Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
-    const ImageOperands operands(ctx, offset, offset2);
     if (ctx.profile.need_gather_subpixel_offset) {
         coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
     }
+    if (ctx.profile.support_image_gather_extended && NeedsRuntimePtp(offset, offset2)) {
+        const Id color{EmitRuntimePtp(&EmitContext::OpImageSparseDrefGather,
+                                     &EmitContext::OpImageDrefGather, ctx, inst, result_type,
+                                     is_integer ? ctx.U32[1] : ctx.F32[1], Texture(ctx, info, index),
+                                     coords, dref, offset, offset2)};
+        return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
+    }
+    const ImageOperands operands(ctx, offset, offset2);
     const Id color{Emit(&EmitContext::OpImageSparseDrefGather, &EmitContext::OpImageDrefGather,
                         ctx, inst, result_type, Texture(ctx, info, index), coords, dref,
                         operands.MaskOptional(), operands.Span())};
