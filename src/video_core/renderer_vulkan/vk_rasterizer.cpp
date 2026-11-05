@@ -282,7 +282,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                      gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
-      frame_dump(device, memory_allocator, scheduler) {
+      frame_dump(device, memory_allocator, scheduler),
+      flash_watch(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
@@ -479,8 +480,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
-    if (frame_dump.Capturing()) {
+    if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
+    }
+    if (flash_watch.WatchesPasses()) {
+        flash_watch.NoteDraw(pipeline->ShaderHashes());
+    }
+    if (frame_dump.Capturing()) {
         frame_dump.NoteDraw(pipeline->ShaderHashes());
         bool recorded = false;
         if (frame_dump.CapturingSampled()) {
@@ -1119,8 +1125,11 @@ void RasterizerVulkan::DrawTexture() {
     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
     const auto* framebuffer = texture_cache.GetFramebuffer();
-    if (frame_dump.Capturing()) {
+    if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
         FrameDumpPass(framebuffer);
+    }
+    if (flash_watch.WatchesPasses()) {
+        flash_watch.NoteDraw({});
     }
 
     const bool src_rescaling = texture_cache.IsRescaling() && texture.IsRescaled();
@@ -1175,7 +1184,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
-    if (frame_dump.Capturing()) {
+    if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
         FrameDumpPass(framebuffer);
     }
     const VkExtent2D render_area = framebuffer->RenderArea();
@@ -1383,6 +1392,9 @@ void RasterizerVulkan::DispatchCompute() {
         frame_dump.EndPass();
         frame_dump.DrainIfFull();
     }
+    if (flash_watch.WatchesPasses()) {
+        flash_watch.EndPass();
+    }
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
     if (!pipeline) {
@@ -1407,14 +1419,19 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     SCOPE_EXIT {
-        if (!frame_dump.Capturing()) {
+        if (!frame_dump.Capturing() && !flash_watch.WatchesPasses()) {
             return;
         }
         boost::container::small_vector<ImageView*, 8> written;
         for (const VideoCommon::ImageViewId id : pipeline->WrittenImages()) {
             written.push_back(&texture_cache.GetImageView(id));
         }
-        frame_dump.CaptureDispatch(pipeline->ShaderHash(), written);
+        if (frame_dump.Capturing()) {
+            frame_dump.CaptureDispatch(pipeline->ShaderHash(), written);
+        }
+        if (flash_watch.WatchesPasses()) {
+            flash_watch.NoteDispatch(pipeline->ShaderHash(), written);
+        }
     };
     TracePendingCpuWrites(true, std::array{pipeline->ShaderHash()});
 
@@ -2036,7 +2053,14 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
             colors[slot] = &texture_cache.GetImageView(ids[slot]);
         }
     }
-    if (frame_dump.BeginPass(framebuffer, colors)) {
+    bool recorded = false;
+    if (frame_dump.Capturing()) {
+        recorded |= frame_dump.BeginPass(framebuffer, colors);
+    }
+    if (flash_watch.WatchesPasses()) {
+        recorded |= flash_watch.BeginPass(framebuffer, colors);
+    }
+    if (recorded) {
         scheduler.RequestRenderpass(framebuffer);
     }
 }
@@ -2072,6 +2096,7 @@ void RasterizerVulkan::TickFrame() {
         }
     }
     frame_dump.TickFrame();
+    flash_watch.TickFrame();
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;
@@ -2266,6 +2291,9 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     if (frame_dump.Capturing()) {
         frame_dump.EndPass();
         frame_dump.CapturePresent(*image_view);
+    }
+    if (flash_watch.Enabled()) {
+        flash_watch.NotePresent(*image_view);
     }
 
     query_cache.NotifySegment(false);
