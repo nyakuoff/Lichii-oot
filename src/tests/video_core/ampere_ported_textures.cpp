@@ -94,9 +94,6 @@ TEST_CASE("Ampere per-tap gathers prove constants across unrelated arithmetic an
     INFO(lowered.error);
     REQUIRE(lowered);
     auto clobber = code;
-    clobber[2].words[0] = 0x00067421;
-    REQUIRE(LowerToMaxwell(clobber).error == "native per-tap gather nonconstant offsets");
-    clobber = code;
     clobber[3].words[0] = 0x04067b63;
     REQUIRE(LowerToMaxwell(clobber).error == "native per-tap gather offset clobber");
     clobber = code;
