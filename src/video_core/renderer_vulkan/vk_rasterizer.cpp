@@ -469,9 +469,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         UpdateDynamicStates();
     }
 
-    query_cache.NotifySegment(true);
-    HandleTransformFeedback();
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    {
+        Profile::Scope scope{Profile::Zone::QueryNotify};
+        query_cache.NotifySegment(true);
+    }
+    {
+        Profile::Scope scope{Profile::Zone::TransformFeedback};
+        HandleTransformFeedback();
+    }
+    {
+        Profile::Scope scope{Profile::Zone::CounterEnable};
+        query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                  maxwell3d->regs.zpass_pixel_count_enable);
+    }
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());

@@ -56,6 +56,10 @@ enum class Zone : u32 {
     WriterWait,
     ListSubmitWait,
     ListGpuWait,
+    QueryNotify,     ///< query_cache.NotifySegment in the draw path
+    TransformFeedback, ///< HandleTransformFeedback in the draw path
+    CounterEnable,   ///< query_cache.CounterEnable in the draw path
+    DrawPrologue,    ///< the rest of the draw path's own work
     Count,
 };
 
@@ -68,6 +72,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
     "writer wait", "list submit wait", "list GPU wait",
+    "query notify", "transform feedback", "counter enable", "draw prologue",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
