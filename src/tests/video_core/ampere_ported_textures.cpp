@@ -108,12 +108,15 @@ TEST_CASE("Ampere per-tap gathers reject unproven offsets and unsupported modes"
             REQUIRE(lowered.error == "native per-tap gather offset range");
         }
     }
-    for (const u32 bit : {60U, 72U, 76U, 78U, 79U, 80U, 81U, 89U, 91U}) {
+    for (const u32 bit : {60U, 72U, 76U, 78U, 80U, 81U, 89U, 91U}) {
         auto invalid = PerTapProgram();
         invalid[2].words[bit / 32] ^= 1U << (bit % 32);
         INFO("bit " << bit);
         REQUIRE_FALSE(LowerToMaxwell(invalid));
     }
+    auto half = PerTapProgram();
+    half[2].words[2] |= 1U << 15; // Bit 79: an F16 per-tap gather.
+    REQUIRE(static_cast<bool>(LowerToMaxwell(half)));
     auto invalid = PerTapProgram();
     invalid[0].words[0] = 0x00081802; // predicated offset definition
     REQUIRE(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
