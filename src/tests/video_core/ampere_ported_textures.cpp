@@ -67,6 +67,19 @@ TEST_CASE("Ampere per-tap gathers pass proven constant offsets to Maxwell TLD4.P
     }
 }
 
+TEST_CASE("Ampere depth-compare gathers use Maxwell TLD4 dc", "[video_core][ampere][gather]") {
+    // TLD4.DC R12/R14, R24 (x, y), R28 (dref), 2D, RGBA, from Ocarina of Time's fragment shader.
+    const Instruction gather{{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}};
+    const auto lowered = LowerToMaxwell(std::array{gather, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto tld4 = std::find_if(lowered.instructions.begin(), lowered.instructions.end(),
+                                   [](u64 instruction) { return ((instruction >> 56) & 0xfc) == 0xc8; });
+    REQUIRE(tld4 != lowered.instructions.end());
+    CHECK(((*tld4 >> 50) & 1) == 1);
+    CHECK(((*tld4 >> 20) & 0xff) == 28);
+}
+
 TEST_CASE("Ampere per-tap gathers prove constants across unrelated arithmetic and gathers",
           "[video_core][ampere][gather]") {
     const std::array<Instruction, 6> code{{
