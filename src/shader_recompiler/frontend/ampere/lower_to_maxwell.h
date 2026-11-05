@@ -101,6 +101,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         return result;
     };
     if (code.empty() || code.size() > 65536) return fail(0, "invalid native program size");
+    const bool relax_per_tap = std::getenv("EDEN_NX2_RELAX_PTP") != nullptr;
+    const auto is_control = [](u32 op) {
+        return (op & 0x1ff) >= 0x140 && (op & 0x1ff) <= 0x15f &&
+               op != 0x941 && op != 0x942 && op != 0x948 && op != 0x348 && op != 0x95b;
+    };
     std::optional<GeometryExitEnvelope> geometry_exit;
     if (code.front().Bits(0, 12) == 0x34e) {
         if (!geometry_stage) return fail(0, "native program counter load outside geometry stage");
@@ -2523,20 +2528,21 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                             terminal = true;
                             break;
                         }
-                        return fail(scan, "native per-tap gather control-flow proof");
+                        if (!relax_per_tap)
+                            return fail(scan, "native per-tap gather control-flow proof");
+                        continue;
                     }
-                    const bool control = (op & 0x1ff) >= 0x140 && (op & 0x1ff) <= 0x15f &&
-                                         op != 0x941 && op != 0x942 && op != 0x948 &&
-                                         op != 0x348 && op != 0x95b;
-                    if (control)
+                    if (is_control(op) && !relax_per_tap)
                         return fail(scan, "native per-tap gather control-flow proof");
                 }
-                if (!terminal) return fail(index, "native per-tap gather terminal proof");
+                if (!relax_per_tap && !terminal)
+                    return fail(index, "native per-tap gather terminal proof");
                 std::array<std::optional<u32>, 2> packed_offsets;
                 for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
                     const auto& definition = code[--cursor];
                     if (definition.Bits(12, 4) == 15) continue;
                     const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
+                    if (is_control(op)) continue;
                     if (op == 0xb63) {
                         const u32 count = static_cast<u32>(std::popcount(definition.Bits(72, 4)));
                         const u32 high = definition.Bits(64, 8);
@@ -2552,9 +2558,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     }
                     for (u32 i = 0; i < 2; ++i) {
                         if (packed_offsets[i] || target != source_b + i) continue;
+                        if (op == 0x424 && definition.Bits(24, 8) == 255 &&
+                            definition.Bits(64, 8) == 255 && definition.words[2] == 0x078e00ff) {
+                            packed_offsets[i] = definition.words[1];
+                            continue;
+                        }
                         if (op != 0x802 || definition.Bits(12, 4) != 7 || definition.Bits(24, 8) ||
                             definition.words[2] != 0x00000f00)
-                            return fail(index, "native per-tap gather nonconstant offsets");
+                            return fail(cursor, "native per-tap gather nonconstant offsets");
                         packed_offsets[i] = definition.words[1];
                     }
                 }
