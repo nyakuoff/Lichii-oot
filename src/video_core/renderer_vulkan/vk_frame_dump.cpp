@@ -31,7 +31,7 @@ namespace {
 
 using VideoCore::Surface::PixelFormat;
 
-constexpr size_t SIZE_CAP = size_t{500} << 20;
+constexpr size_t SIZE_CAP = size_t{2} << 30;
 /// RecordingSampledTextures: a sampled capture is running.
 std::atomic<bool> recording_sampled{};
 constexpr size_t STAGING_BUDGET = size_t{256} << 20;
@@ -248,15 +248,32 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}", directory.string(), value);
 }
 
-FrameDump::~FrameDump() = default;
+FrameDump::~FrameDump() {
+    StopWriter();
+}
+
+void FrameDump::StopWriter() {
+    if (!writer.joinable()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{queue_mutex};
+        stop_writer = true;
+    }
+    queue_ready.notify_one();
+    writer.join();
+    stop_writer = false;
+}
 
 void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers, u64 id) {
     if (!schedule.Arm(sampled, buffers, id)) {
         VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
         return;
     }
+    StopWriter();
     directory = std::move(directory_);
     truncated = false;
+    recorded_bytes = 0;
     written_bytes = 0;
     sequence = 0;
     images = 0;
@@ -398,11 +415,10 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
     }
     const Image& image = *texture.view->BackingImage();
     const auto& info = image.info;
-    manifest << fmt::format(
-                    R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"type":{},"gpu_addr":"{:#x}","skipped":"format"}})",
-                    name, tags, info.format, info.size.width, info.size.height, info.size.depth,
-                    static_cast<u32>(info.type), image.gpu_addr)
-             << '\n';
+    Enqueue({.tags = fmt::format(
+                 R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"type":{},"gpu_addr":"{:#x}","skipped":"format"}})",
+                 name, tags, info.format, info.size.width, info.size.height, info.size.depth,
+                 static_cast<u32>(info.type), image.gpu_addr)});
     return false;
 }
 
@@ -469,11 +485,12 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
             buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
             buffer.gpu_modified, from_host ? "host" : "guest");
         if (!from_host) {
-            if (written_bytes + pending_bytes + buffer.guest.size() > SIZE_CAP) {
+            if (recorded_bytes + buffer.guest.size() > SIZE_CAP) {
                 truncated = true;
                 continue;
             }
-            WriteBuffer(tags, buffer.guest);
+            recorded_bytes += buffer.guest.size();
+            Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
             continue;
         }
         recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
@@ -494,7 +511,7 @@ void FrameDump::NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
         tags += fmt::format(R"(,"indirect_grid_guest":[{},{},{}])", (*indirect_grid)[0],
                             (*indirect_grid)[1], (*indirect_grid)[2]);
     }
-    manifest << tags << "}\n";
+    Enqueue({.tags = tags + "}"});
 }
 
 void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
@@ -558,14 +575,15 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
                              : fmt::format("_{}_{}x{}_{:x}", target.format, target.width,
                                            target.height, target.gpu_addr);
     if (target.msaa) {
-        manifest << fmt::format(R"({{"name":"{}",{},"skipped":"msaa"}})", name, tags) << '\n';
+        Enqueue({.tags = fmt::format(R"({{"name":"{}",{},"skipped":"msaa"}})", name, tags)});
         return false;
     }
     const size_t size = size_t{target.width} * target.height * target.depth * TexelBytes(target);
-    if (written_bytes + pending_bytes + size > SIZE_CAP) {
+    if (recorded_bytes + size > SIZE_CAP) {
         truncated = true;
         return false;
     }
+    recorded_bytes += size;
     vk::Buffer buffer = memory_allocator.CreateBuffer(
         VkBufferCreateInfo{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -615,10 +633,11 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
 }
 
 bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
-    if (written_bytes + pending_bytes + size > SIZE_CAP) {
+    if (recorded_bytes + size > SIZE_CAP) {
         truncated = true;
         return false;
     }
+    recorded_bytes += size;
     vk::Buffer buffer = memory_allocator.CreateBuffer(
         VkBufferCreateInfo{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -671,22 +690,72 @@ void FrameDump::Drain() {
     scheduler.Finish();
     for (Readback& readback : readbacks) {
         readback.buffer.Invalidate();
-        if (readback.raw) {
-            WriteBuffer(readback.tags, readback.buffer.Mapped().first(readback.bytes));
-        } else {
-            Write(readback, readback.buffer.Mapped());
-        }
+        const Target& target = readback.target;
+        const size_t size = readback.raw ? readback.bytes : size_t{target.width} * target.height *
+                                                            target.depth * TexelBytes(target);
+        const auto mapped = readback.buffer.Mapped().first(size);
+        Enqueue({.target = target,
+                 .name = std::move(readback.name),
+                 .tags = std::move(readback.tags),
+                 .data = {mapped.begin(), mapped.end()},
+                 .raw = readback.raw});
     }
     readbacks.clear();
     pending_bytes = 0;
 }
 
-void FrameDump::Write(const Readback& readback, std::span<const u8> mapped) {
-    const Target& target = readback.target;
+void FrameDump::Enqueue(Job job) {
+    {
+        std::scoped_lock lock{queue_mutex};
+        queue.push_back(std::move(job));
+    }
+    queue_ready.notify_one();
+}
+
+void FrameDump::WriterLoop() {
+    for (;;) {
+        Job job;
+        {
+            std::unique_lock lock{queue_mutex};
+            queue_ready.wait(lock, [this] { return !queue.empty() || stop_writer; });
+            if (queue.empty()) {
+                return;
+            }
+            job = std::move(queue.front());
+            queue.pop_front();
+        }
+        if (job.summary) {
+            manifest << fmt::format(
+                            R"({{"kind":"summary","images":{},{},"bytes":{},"truncated":{}}})",
+                            images, job.tags, written_bytes, job.truncated)
+                     << '\n';
+            manifest.close();
+            LOG_INFO(Render_Vulkan, "Frame dump done: {} images, {}, {} MiB in {}{}", images,
+                     job.tags, written_bytes >> 20, directory.string(),
+                     job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SIZE_CAP >> 30)
+                                   : "");
+            if (const u64 id = job.capture_id; id != 0) {
+                VideoCore::Nx2Debug::FinishCapture(id, {});
+            }
+            continue;
+        }
+        if (job.raw) {
+            WriteBuffer(job.tags, job.data);
+        } else if (job.name.empty()) {
+            manifest << job.tags << '\n';
+        } else {
+            Write(job);
+        }
+        manifest.flush();
+    }
+}
+
+void FrameDump::Write(const Job& job) {
+    const Target& target = job.target;
     const u32 bytes_per_pixel = TexelBytes(target);
     const size_t pixels = size_t{target.width} * target.height * target.depth;
-    const auto data = mapped.first(pixels * bytes_per_pixel);
-    WriteFile(readback.name + ".raw.zst",
+    const std::span<const u8> data = job.data;
+    WriteFile(job.name + ".raw.zst",
               Common::Compression::CompressDataZSTDDefault(data.data(), data.size()));
     ++images;
 
@@ -752,15 +821,15 @@ void FrameDump::Write(const Readback& readback, std::span<const u8> mapped) {
             &encoded, static_cast<int>(target.width), static_cast<int>(target.height * target.depth), 3,
             rgb.data(), static_cast<int>(target.width * 3));
         if (ok != 0) {
-            WriteFile(readback.name + ".png", encoded);
-            png = fmt::format("\"{}.png\"", readback.name);
+            WriteFile(job.name + ".png", encoded);
+            png = fmt::format("\"{}.png\"", job.name);
         }
     }
     manifest << fmt::format(
                     R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"level":{},"layer":{},"gpu_addr":"{:#x}","rescaled":{},"depth_encoding":{},"raw":"{}.raw.zst","png":{}{}}})",
-                    readback.name, readback.tags, target.format, target.width, target.height,
+                    job.name, job.tags, target.format, target.width, target.height,
                     target.depth, target.level, target.layer, target.gpu_addr, target.rescaled,
-                    static_cast<u32>(target.depth_encoding), readback.name, png, stats)
+                    static_cast<u32>(target.depth_encoding), job.name, png, stats)
              << '\n';
 }
 
@@ -789,18 +858,11 @@ void FrameDump::TickFrame() {
     case FrameDumpSchedule::Step::Finish:
         EndPass();
         Drain();
-        manifest << fmt::format(
-                        R"({{"kind":"summary","images":{},"passes":{},"draws":{},"dispatches":{},"bytes":{},"truncated":{}}})",
-                        images, pass_index, draws, dispatches, written_bytes, truncated)
-                 << '\n';
-        manifest.close();
-        if (const u64 id = schedule.CaptureId(); id != 0) {
-            VideoCore::Nx2Debug::FinishCapture(id, {});
-        }
-        LOG_INFO(Render_Vulkan,
-                 "Frame dump done: {} images, {} passes, {} draws, {} dispatches, {} MiB in {}{}",
-                 images, pass_index, draws, dispatches, written_bytes >> 20, directory.string(),
-                 truncated ? " (stopped at the 500 MiB cap)" : "");
+        Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{})", pass_index,
+                                     draws, dispatches),
+                 .summary = true,
+                 .truncated = truncated,
+                 .capture_id = schedule.CaptureId()});
         return;
     case FrameDumpSchedule::Step::Start:
         break;
@@ -820,6 +882,7 @@ void FrameDump::TickFrame() {
     const u64 frame = schedule.Frame();
     manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
              << '\n';
+    writer = std::thread{[this] { WriterLoop(); }};
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
              elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), directory.string());
 }
