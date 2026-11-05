@@ -1577,11 +1577,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{operation} << 29) | (u64{dimension} << 33) | (u64{offset} << 36));
             break;
         }
-        case 0x59f: { // SURED.D.ADD.STRONG.GPU.IGN U32, direct descriptor, buffer or 2D.
+        case 0x59f: { // SURED.D.{ADD..XOR}.STRONG.GPU.IGN U32, direct descriptor, buffer or 2D.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
-            if (insn.words[2] != 0x0010e000 || (dimension != 1 && dimension != 3) || binding >= 18 ||
+            // The reduction operation is numbered as in Maxwell's ATOMS, in bits 87-89; only the
+            // rest of the word is fixed.
+            const u32 operation = insn.Bits(87, 3);
+            if ((insn.words[2] & ~0x03800000U) != 0x0010e000 ||
+                (dimension != 1 && dimension != 3) || binding >= 18 ||
                 offset > 0x1fff || insn.Bits(59, 2) || coordinate > 253)
                 return fail(index, "native surface reduction mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
@@ -1590,7 +1594,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Maxwell SURED (as the frontend decodes it): operand 0-7, coordinates 8-15, ADD and
             // U32 are zero at 24 and 20, type 33 (1 = buffer, 3 = 2D), bound offset 36, bound 51.
             emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
-                (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
+                (u64{operation} << 24) | (u64{dimension} << 33) | (u64{offset} << 36) |
+                (u64{1} << 51));
             break;
         }
         case 0x301: // BREV register.

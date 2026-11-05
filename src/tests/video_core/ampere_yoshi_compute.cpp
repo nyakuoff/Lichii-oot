@@ -54,6 +54,24 @@ TEST_CASE("Ampere IMNMX retains its signed twenty-bit immediate encoding", "[amp
     REQUIRE_FALSE(LowerToMaxwell(std::array{unsupported, Exit}));
 }
 
+TEST_CASE("Ocarina captured SURED keeps its reduction operation", "[ampere][oot]") {
+    // SURED U32 R0 (operand), R4 (2D coordinate), cbuf 0 + 0x84, operation 6, from Ocarina of
+    // Time's post-cutscene compute shaders.
+    const Instruction reduction{{0x0400159f, 0x60008400, 0x0310e000, 0x0001e200}};
+    const auto lowered = LowerToMaxwell(std::array{reduction, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    REQUIRE(lowered.instructions.size() == 2);
+    CHECK(lowered.required_texture_buffer == 0);
+    const u64 sured = lowered.instructions[0];
+    CHECK((sured >> 56) == 0xeb);
+    CHECK((sured & 0xff) == 0);               // operand R0
+    CHECK(((sured >> 8) & 0xff) == 4);        // coordinate R4
+    CHECK(((sured >> 24) & 7) == 6);          // reduction operation
+    CHECK(((sured >> 33) & 7) == 3);          // 2D
+    CHECK(((sured >> 36) & 0x1fff) == 0x84);  // descriptor offset
+}
+
 TEST_CASE("Yoshi captured SURED uses a buffer coordinate and descriptor", "[ampere][yoshi]") {
     for (const u32 dimension : {1U, 3U}) {
         for (const u32 guard : {0U, 7U, 9U}) {
