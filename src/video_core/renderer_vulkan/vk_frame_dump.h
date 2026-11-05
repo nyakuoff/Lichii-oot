@@ -62,6 +62,9 @@ public:
     /// Waits for pending readbacks and writes them once they pass the staging budget.
     void DrainIfFull();
     void TickFrame();
+    /// Captures the next frame into `directory` for the debug server, which is told `id` once
+    /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
+    void Arm(std::filesystem::path directory, bool sampled, u64 id);
 
 private:
     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };
@@ -111,6 +114,8 @@ private:
     double trigger_seconds{};
     std::chrono::steady_clock::time_point start;
     u64 frame{};
+    /// Debug server request being captured, 0 for EDEN_NX2_FRAME_DUMP's own capture.
+    u64 capture_id{};
 
     std::ofstream manifest;
     std::vector<Readback> readbacks;

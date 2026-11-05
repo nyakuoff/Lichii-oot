@@ -14,6 +14,7 @@
 #include "common/settings.h"
 #include "common/stb.h"
 #include "common/zstd_compression.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -207,6 +208,30 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
 }
 
 FrameDump::~FrameDump() = default;
+
+void FrameDump::Arm(std::filesystem::path directory_, bool sampled_, u64 id) {
+    if (capturing) {
+        VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
+        return;
+    }
+    enabled = true;
+    done = false;
+    sampled = sampled_;
+    directory = std::move(directory_);
+    trigger_frame = 0;
+    capture_id = id;
+    truncated = false;
+    written_bytes = 0;
+    sequence = 0;
+    images = 0;
+    pass_framebuffer = nullptr;
+    pass_index = 0;
+    draws = 0;
+    dispatches = 0;
+    if (start == std::chrono::steady_clock::time_point{}) {
+        start = std::chrono::steady_clock::now();
+    }
+}
 
 std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot) const {
     using namespace VideoCore::Surface;
@@ -588,6 +613,9 @@ void FrameDump::TickFrame() {
                         images, pass_index, draws, dispatches, written_bytes, truncated)
                  << '\n';
         manifest.close();
+        if (capture_id != 0) {
+            VideoCore::Nx2Debug::FinishCapture(capture_id, {});
+        }
         capturing = false;
         done = true;
         LOG_INFO(Render_Vulkan,
@@ -608,6 +636,10 @@ void FrameDump::TickFrame() {
     manifest.open(directory / "manifest.jsonl", std::ios::trunc);
     if (!manifest) {
         LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", directory.string());
+        if (capture_id != 0) {
+            VideoCore::Nx2Debug::FinishCapture(
+                capture_id, {.error = fmt::format("cannot write {}", directory.string())});
+        }
         done = true;
         return;
     }
