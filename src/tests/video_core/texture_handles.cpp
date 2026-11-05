@@ -132,6 +132,46 @@ struct HandleProgram {
 };
 }
 
+TEST_CASE("Depth comparisons remain floating point when the descriptor reports an integer format",
+          "[video_core][texture_handles][spirv][oot]") {
+    for (const auto opcode : {Opcode::ImageSampleDrefImplicitLod,
+                              Opcode::ImageSampleDrefExplicitLod, Opcode::ImageGatherDref}) {
+        for (const bool integer : {false, true}) {
+            CAPTURE(opcode, integer);
+            HandleProgram shader;
+            shader.env.integer_texture = integer;
+            IR::IREmitter ir{shader.block};
+            const auto handle{ir.GetCbuf(ir.Imm32(0), ir.Imm32(0))};
+            const auto coords{ir.CompositeConstruct(ir.Imm32(0.25f), ir.Imm32(0.75f))};
+            IR::TextureInstInfo flags{};
+            flags.type.Assign(Shader::TextureType::Color2D);
+            flags.is_depth.Assign(1);
+            Value sample;
+            switch (opcode) {
+            case Opcode::ImageSampleDrefImplicitLod:
+                sample = ir.ImageSampleDrefImplicitLod(handle, coords, ir.Imm32(0.5f), {}, {}, {},
+                                                       flags);
+                break;
+            case Opcode::ImageSampleDrefExplicitLod:
+                sample = ir.ImageSampleDrefExplicitLod(handle, coords, ir.Imm32(0.5f),
+                                                       ir.Imm32(0.0f), {}, flags);
+                break;
+            case Opcode::ImageGatherDref:
+                sample = ir.ImageGatherDref(handle, coords, {}, {}, ir.Imm32(0.5f), flags);
+                break;
+            default:
+                FAIL("Unexpected depth comparison opcode");
+            }
+            shader.Run();
+            REQUIRE(shader.program.info.texture_descriptors.size() == 1);
+            const auto& descriptor{shader.program.info.texture_descriptors.front()};
+            CHECK(descriptor.is_depth);
+            CHECK_FALSE(descriptor.is_integer);
+            CHECK(sample.Inst()->Flags<IR::TextureInstInfo>().is_integer == 0);
+        }
+    }
+}
+
 TEST_CASE("Sampled descriptors distinguish static and computed handles",
           "[video_core][texture_handles]") {
     HandleProgram shader;
