@@ -34,6 +34,17 @@ TEST_CASE("Ampere uniform IMAD with an immediate addend lowers", "[video_core][a
                         [](u64 instruction) { return (instruction >> 48) == 0x5c18; }));
 }
 
+TEST_CASE("Ampere LEA.HI with a negated base lowers", "[video_core][ampere]") {
+    // LEA.HI R1, R1, -R0, RZ, 0x1e from Ocarina of Time's compute shaders.
+    const std::array<Instruction, 2> code{{{{0x01017211, 0x80000000, 0x078ff0ff, 0x000fca00}}, Exit}};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+    // ISUB: the high word (R250) plus R250 and -R0 (IADD neg_b).
+    REQUIRE(std::any_of(lowered.instructions.begin(), lowered.instructions.end(),
+                        [](u64 instruction) { return (instruction >> 48) == 0x5c11; }));
+}
+
 TEST_CASE("Ampere LEA.HI with a constant base still rejects a carry out", "[video_core][ampere]") {
     // The same LEA.HI writing a carry out to P0 has no lowering yet.
     Instruction carry{{0x11017a11, 0x00c00000, 0x078ff0ff, 0x000fe400}};
