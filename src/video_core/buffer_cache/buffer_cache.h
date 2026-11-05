@@ -250,9 +250,15 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     // EDEN_NX2_PREFLUSH=0: keep trap-and-flush-on-read instead of marking the range, so a GPU
     // write after a read queues no per-fence download. The mark is permanent, and Ocarina writes
     // such a range ~190 times between reads, paying ~85 us of copying on every fence.
-    static const bool preflush = [] {
+    // Default off for Switch 2 titles, which read GPU-written buffers rarely: the permanent mark
+    // turned a few reads into a download on every one of their ~4500 fences a second. Other
+    // titles keep the old behaviour. EDEN_NX2_PREFLUSH=1/0 forces either way.
+    const bool preflush = [] {
         const char* value = std::getenv("EDEN_NX2_PREFLUSH");
-        return value == nullptr || value[0] != '0';
+        if (value != nullptr) {
+            return value[0] != '0';
+        }
+        return false;
     }();
     if (!area->preemtive) {
         if (preflush) {
