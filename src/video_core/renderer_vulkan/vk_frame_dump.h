@@ -23,6 +23,7 @@ namespace Vulkan {
 class Device;
 class ImageView;
 class MemoryAllocator;
+class Sampler;
 class Scheduler;
 
 /// When FrameDump captures, and whether it reads the sampled textures back. Kept apart from the
@@ -32,11 +33,12 @@ public:
     enum class Step { None, Start, Finish };
 
     /// EDEN_NX2_FRAME_DUMP_AT: seconds after boot ("45"), a frame number ("2700f"), or "file" to
-    /// capture once `trigger_file` exists.
+    /// capture once `trigger_file` exists. EDEN_NX2_FRAME_DUMP_SAMPLED reads back both the
+    /// sampled textures and the bound buffers.
     void Configure(std::string_view at, std::filesystem::path trigger_file, bool sampled);
     /// Captures the next frame for the debug server, which is told `id`. False while a capture
     /// runs.
-    bool Arm(bool sampled, u64 id);
+    bool Arm(bool sampled, bool buffers, u64 id);
     /// Once per presented frame: whether a capture starts with the next frame or has ended.
     Step Tick(double elapsed_seconds);
     /// The capture Tick started could not begin.
@@ -47,6 +49,10 @@ public:
     }
     [[nodiscard]] bool Sampled() const noexcept {
         return sampled;
+    }
+    /// Whether the uniform and storage buffers and dispatch group counts are recorded.
+    [[nodiscard]] bool Buffers() const noexcept {
+        return buffers;
     }
     [[nodiscard]] u64 Frame() const noexcept {
         return frame;
@@ -61,6 +67,7 @@ private:
 
     bool enabled{};
     bool sampled{};
+    bool buffers{};
     bool capturing{};
     bool done{};
     std::filesystem::path trigger_file;
@@ -78,13 +85,32 @@ private:
 /// images written by every compute dispatch and the presented image. EDEN_NX2_FRAME_DUMP_AT picks
 /// the frame, in seconds after boot ("45") or as a frame number ("2700f").
 /// EDEN_NX2_FRAME_DUMP_SAMPLED=1 also reads back every texture a pass samples (3D and depth
-/// included), once per pass, as the first draw sampling it sees it.
+/// included), once per pass, as the first draw sampling it sees it, plus compute sampled textures,
+/// sampler state, bound uniform/storage buffers and dispatch group counts.
 class FrameDump {
 public:
     struct Sampled {
         u32 stage;
         u32 tic;
         ImageView* view;
+        const Sampler* sampler;
+    };
+
+    /// A uniform or storage buffer binding. Its bytes come from guest memory, or from the host
+    /// buffer when the GPU wrote the range and guest memory may be stale.
+    struct BoundBuffer {
+        u32 stage;
+        bool storage;
+        u32 index;
+        bool written;
+        GPUVAddr gpu_addr;
+        u64 device_addr;
+        u32 bound_size;
+        u32 size;
+        bool gpu_modified;
+        VkBuffer host;
+        u32 host_offset;
+        std::vector<u8> guest;
     };
 
     explicit FrameDump(const Device& device, MemoryAllocator& memory_allocator,
@@ -99,10 +125,22 @@ public:
         return schedule.Capturing() && schedule.Sampled();
     }
 
+    [[nodiscard]] bool CapturingBuffers() const noexcept {
+        return schedule.Capturing() && schedule.Buffers();
+    }
+
     /// Reads back the textures of the current draw not yet seen in this pass. Returns true when
     /// copies were recorded, which ends the current render pass.
     bool NoteSampled(std::span<const Sampled> textures);
     void NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> textures);
+    /// Records the buffers of the current draw (shader hashes by program) or of the dispatch about
+    /// to run not yet seen for their shader. Returns true when copies were recorded.
+    bool NoteBuffers(bool compute, std::span<const u64> shader_hashes,
+                     std::span<BoundBuffer> buffers);
+    /// Records the group counts of the dispatch about to run.
+    void NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
+                    const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
+                    std::optional<std::array<u32, 3>> indirect_grid);
 
     /// Starts a pass when the framebuffer changes and captures the previous one.
     /// Returns true when copies were recorded, which ends the current render pass.
@@ -117,7 +155,7 @@ public:
     void TickFrame();
     /// Captures the next frame into `directory` for the debug server, which is told `id` once
     /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
-    void Arm(std::filesystem::path directory, bool sampled, u64 id);
+    void Arm(std::filesystem::path directory, bool sampled, bool buffers, u64 id);
 
 private:
     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };
@@ -137,11 +175,14 @@ private:
         DepthEncoding depth_encoding;
     };
 
+    /// An image readback, or a buffer one (`raw`) of `bytes` bytes.
     struct Readback {
         vk::Buffer buffer;
         Target target;
         std::string name;
         std::string tags;
+        bool raw{};
+        size_t bytes{};
     };
 
     std::optional<Target> MakeTarget(ImageView& view, u32 slot) const;
@@ -149,8 +190,10 @@ private:
     static int Decode(const Target& target, const u8* pixel, std::array<float, 4>& out);
     bool Record(const Target& target, std::string name, std::string tags);
     bool RecordSampled(const Sampled& texture, u32 index, std::string name, std::string tags);
+    bool RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags);
     void Drain();
     void Write(const Readback& readback, std::span<const u8> data);
+    void WriteBuffer(std::string_view tags, std::span<const u8> data);
     void WriteFile(const std::string& name, std::span<const u8> data);
 
     const Device& device;
@@ -174,6 +217,10 @@ private:
     std::vector<u64> pass_hashes;
     std::vector<std::pair<GPUVAddr, u32>> pass_sampled;
     std::vector<std::tuple<u64, GPUVAddr, u32>> dispatch_sampled;
+    /// (shader hash, storage, binding index, device address, size) already recorded this frame.
+    std::vector<std::tuple<u64, bool, u32, u64, u32>> seen_buffers;
+    /// Content hashes of the buffer files written.
+    std::vector<u64> written_buffers;
     u32 pass_index{};
     u32 pass_first_draw{};
     u32 draws{};
