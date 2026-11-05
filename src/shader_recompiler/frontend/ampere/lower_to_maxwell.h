@@ -2518,15 +2518,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     if (instruction.Bits(12, 4) == 15) continue;
                     const u32 op = instruction.Bits(0, 12);
         uses_uniform_bank |= op == 0x83b && instruction.Bits(91, 1);
-                    if (op == 0x94d && instruction.Bits(12, 4) == 7) {
-                        terminal = true;
-                        break;
+                    if (op == 0x94d) {
+                        if (instruction.Bits(12, 4) == 7) {
+                            terminal = true;
+                            break;
+                        }
+                        return fail(scan, "native per-tap gather control-flow proof");
                     }
-                    if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
-                        op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
-                        op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820 &&
-                        op != 0xab9 && op != 0x919 && op != 0x981 && op != 0x424 &&
-                        op != 0x824 && op != 0x827 && op != 0x810)
+                    const bool control = (op & 0x1ff) >= 0x140 && (op & 0x1ff) <= 0x15f &&
+                                         op != 0x941 && op != 0x942 && op != 0x948 &&
+                                         op != 0x348 && op != 0x95b;
+                    if (control)
                         return fail(scan, "native per-tap gather control-flow proof");
                 }
                 if (!terminal) return fail(index, "native per-tap gather terminal proof");
