@@ -382,6 +382,20 @@ json RejectShaders(ToolState&, const json& params) {
 
 // Records what the emulator's threads do and wait for (common/nx2_timeline.h) and returns once
 // the Chrome trace is written.
+#if defined(__LLVM_INSTR_PROFILE_GENERATE)
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
+// Writes the instrumented build's profile now (clang -fprofile-instr-generate builds only): it is
+// otherwise written at a clean exit, which a training run can't always get.
+json PgoDump(ToolState&, const json&) {
+#if defined(__LLVM_INSTR_PROFILE_GENERATE)
+    return {{"written", __llvm_profile_write_file() == 0}};
+#else
+    throw std::runtime_error{"not an instrumented (-fprofile-instr-generate) build"};
+#endif
+}
+
 json Timeline(ToolState& state, const json& params) {
     const double seconds = Param<double>(params, "seconds", 5.0, 0.1, 30.0);
     const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -611,6 +625,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"reject_shaders", handler(RejectShaders)},
         {"sample", handler(SampleThreads)},
         {"timeline", handler(Timeline)},
+        {"pgo_dump", handler(PgoDump)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},
