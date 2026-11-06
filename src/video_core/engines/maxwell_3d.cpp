@@ -1429,9 +1429,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
     flush_if_dirty();
+    // With the diag, the read the narrower wait allows is repeated after a full drain, and the
+    // reads whose words differ count, apart from those report results written meanwhile outside
+    // the command order (Diag::NoteAsyncWrite) changed.
+    namespace Diag = Tegra::Nx2CmdPageDiag;
     std::vector<u32> diag_before;
-    if (Tegra::Nx2CmdPageDiag::g_enabled) {
+    u64 async_from = 0;
+    if (Diag::g_enabled) {
         diag_before.resize(words);
+        async_from = Diag::g_async_writes.load();
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
         split.Drain(VideoCommon::DrainSite::MacroDmaCheck);
         flush_if_dirty();
@@ -1448,13 +1454,17 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             ++changed;
         }
     }
-    if (Tegra::Nx2CmdPageDiag::g_enabled) {
+    if (Diag::g_enabled) {
         bool gpu_written = false;
         for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
             const auto device = memory_manager.GpuToCpuAddress(page);
             gpu_written |= device && Tegra::Nx2IsGpuWritten(*device);
         }
-        Tegra::Nx2CmdPageDiag::RecordDmaRead(source, words, changed, gpu_written);
+        const u64 async_to = Diag::g_async_writes.load();
+        const u64 device = memory_manager.GpuToCpuAddress(source).value_or(0);
+        Diag::RecordDmaRead(source, words, changed, gpu_written,
+                            changed != 0 &&
+                                Diag::AsyncWroteBetween(async_from, async_to, device, read_bytes));
     }
 }
 

@@ -91,10 +91,50 @@ struct State {
     std::atomic<u64> dma_reads_gpu_pages{};
     std::atomic<u64> dma_reads_changed{};
     std::atomic<u64> dma_reads_changed_gpu_pages{};
+    std::atomic<u64> dma_reads_changed_async{};
     std::atomic<u32> dma_changed_logged{};
     std::array<u32, static_cast<size_t>(Kind::Count)> details_logged{};
     std::chrono::steady_clock::time_point last_log{std::chrono::steady_clock::now()};
 };
+
+/// Guest memory written outside the split's command order (report results the fence thread
+/// writes when the host GPU completes): a macro DMA read can see them earlier or later however
+/// long the front waited, so the diag tells them apart from writes a narrower wait missed.
+struct AsyncWrite {
+    std::atomic<u64> sequence{};
+    std::atomic<u64> address{};
+    std::atomic<u64> bytes{};
+};
+inline std::atomic<u64> g_async_writes{};
+inline std::array<AsyncWrite, 4096> g_async_ring{};
+
+inline void NoteAsyncWrite(u64 device_addr, u64 bytes) {
+    const u64 sequence = g_async_writes.fetch_add(1, std::memory_order_acq_rel) + 1;
+    AsyncWrite& write = g_async_ring[sequence % g_async_ring.size()];
+    write.address.store(device_addr, std::memory_order_relaxed);
+    write.bytes.store(bytes, std::memory_order_relaxed);
+    write.sequence.store(sequence, std::memory_order_release);
+}
+
+/// Whether an async write after `from` and up to `to` (g_async_writes values) touched
+/// [device_addr, device_addr + bytes). False when the ring no longer holds them all.
+inline bool AsyncWroteBetween(u64 from, u64 to, u64 device_addr, u64 bytes) {
+    if (to - from >= g_async_ring.size()) {
+        return false;
+    }
+    for (u64 sequence = from + 1; sequence <= to; ++sequence) {
+        const AsyncWrite& write = g_async_ring[sequence % g_async_ring.size()];
+        if (write.sequence.load(std::memory_order_acquire) != sequence) {
+            continue;
+        }
+        const u64 address = write.address.load(std::memory_order_relaxed);
+        if (address < device_addr + bytes &&
+            device_addr < address + write.bytes.load(std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 inline State& Get() {
     static State state;
@@ -193,12 +233,17 @@ inline void CheckMissedWrite(u64 page_addr, u32 begin, u32 end) {
 
 /// The front's macro read `words` at `source` (MME DMA): `changed` of them differ between the
 /// read after waiting for memory writers and the last sync and the read after a full drain;
-/// `gpu_written`: on pages GPU work has written.
-inline void RecordDmaRead(u64 source, u32 words, u32 changed, bool gpu_written) {
+/// `gpu_written`: on pages GPU work has written. `async`: the words that changed were written
+/// by an async write (NoteAsyncWrite) between the two reads.
+inline void RecordDmaRead(u64 source, u32 words, u32 changed, bool gpu_written, bool async) {
     State& state = Get();
     state.dma_reads.fetch_add(1, std::memory_order_relaxed);
     state.dma_reads_gpu_pages.fetch_add(gpu_written ? 1 : 0, std::memory_order_relaxed);
     if (changed == 0) {
+        return;
+    }
+    if (async) {
+        state.dma_reads_changed_async.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     state.dma_reads_changed.fetch_add(1, std::memory_order_relaxed);
@@ -253,7 +298,8 @@ inline void Log() {
              "{} unknown {} (on draw pages {}) | sync waits {} in {:.1f} ms | missed draw writes "
              "on entry {} elsewhere {} | list page writes draw {} (whole page {}) dispatch/copy "
              "{}; draw-written list pages {} | macro DMA reads {} (on GPU-written pages {}), "
-             "changed by the drain {} (on GPU-written pages {})",
+             "changed by the drain {} (on GPU-written pages {}), changed by async report writes "
+             "{}",
              seconds, path(Path::Submitted), path(Path::Safe), path(Path::Copy), path(Path::Slow),
              Take(state.slow_drained), Take(state.slow_flushed),
              static_cast<double>(Take(state.slow_ns)) / 1e6, kind_names[0], kinds[0], changed[0],
@@ -265,7 +311,7 @@ inline void Log() {
              Take(state.missed_elsewhere), Take(state.draw_writes),
              Take(state.draw_writes_whole_page), Take(state.other_writes), draw_pages,
              Take(state.dma_reads), Take(state.dma_reads_gpu_pages), Take(state.dma_reads_changed),
-             Take(state.dma_reads_changed_gpu_pages));
+             Take(state.dma_reads_changed_gpu_pages), Take(state.dma_reads_changed_async));
 }
 
 /// The front parsed an entry through `path`.

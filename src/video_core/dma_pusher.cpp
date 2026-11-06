@@ -55,6 +55,8 @@ void DmaPusher::DispatchCalls() {
             gpu->FlushCommands();
             gpu->OnCommandListEnd();
         });
+        // Fences released here may write guest memory (their deferred operations).
+        split.NoteMemoryWrite();
         split.Publish();
         return;
     }

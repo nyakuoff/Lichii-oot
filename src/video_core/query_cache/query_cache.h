@@ -24,6 +24,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"
@@ -323,6 +324,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         } else {
             u32 value = static_cast<u32>(query_base->value);
             std::memcpy(pointer, &value, sizeof(value));
+        }
+        if (Tegra::Nx2CmdPageDiag::g_enabled) {
+            Tegra::Nx2CmdPageDiag::NoteAsyncWrite(cpu_addr, 16);
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
