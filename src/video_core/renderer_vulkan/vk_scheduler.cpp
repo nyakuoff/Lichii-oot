@@ -190,7 +190,10 @@ bool Scheduler::DeferFlush() {
         if (value != nullptr) {
             return static_cast<s64>(std::atoll(value));
         }
-        return s64{500};
+        // 0 by default (EvilOOT's flash fix): Ocarina of Time flashed white with the 500 us batch
+        // (sword boulder with preflush: 31 whole-screen flashes in 30 s, 0 without), and ran
+        // faster without it (Lake Hylia 52.3 -> 55.4 fps). EDEN_NX2_FENCE_FLUSH_US=500 restores it.
+        return s64{0};
     }();
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
