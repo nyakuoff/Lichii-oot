@@ -297,7 +297,11 @@ static const u32 g_semaphore_watch = [] {
 }();
 
 // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
-static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+// Read on first use: nx2_switches.txt is applied in main(), after static initialisation.
+static bool RecordParsedEntries() {
+    static const bool record = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+    return record;
+}
 
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {
@@ -813,7 +817,7 @@ void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash
 
 void DmaPusher::RecordParsedEntry(const CommandListHeader& header,
                                   std::span<const CommandHeader> commands) {
-    if (!g_record_parsed_entries) {
+    if (!RecordParsedEntries()) {
         return;
     }
     u64 hash = 0xcbf29ce484222325ULL;
