@@ -349,8 +349,9 @@ struct Values {
     SwitchableSetting<ResolutionSetup> resolution_setup{linkage, ResolutionSetup::Res1X,
                                                         "resolution_setup", Category::Renderer};
 
+    // Mailbox: the host frame pacer (vk_host_pacer.h) times presents to the display itself.
     SwitchableSetting<VSyncMode, true> vsync_mode{linkage,
-                                                  VSyncMode::Fifo,
+                                                  VSyncMode::Mailbox,
                                                   "use_vsync",
                                                   Category::Renderer,
                                                   Specialization::RuntimeList,
@@ -529,11 +530,9 @@ struct Values {
                                          linkage, 0, "bg_blue", Category::Renderer, Specialization::Default, true, true};
 
     SwitchableSetting<GpuAccuracy, true> gpu_accuracy{linkage,
-#ifdef __ANDROID__
+                                                      // Low on desktop too: the Frizti builds are
+                                                      // tuned for Ocarina of Time there.
                                                       GpuAccuracy::Low,
-#else
-                                                      GpuAccuracy::High,
-#endif
                                                       "gpu_accuracy",
                                                       Category::RendererAdvanced,
                                                       Specialization::Default,
@@ -623,6 +622,12 @@ struct Values {
     SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
                                                 Category::RendererAdvanced};
 
+    // Ocarina of Time: present at 30 fps for lower-end PCs (nx2_gsv.h PaceToVblank). The game's
+    // timing follows real time (Dynamic FPS by Dark), so it keeps full speed. Asked once at the
+    // first launch (oot_fps_asked).
+    SwitchableSetting<bool> oot_30fps{linkage, false, "oot_30fps", Category::RendererAdvanced};
+    Setting<bool> oot_fps_asked{linkage, false, "oot_fps_asked", Category::RendererAdvanced};
+
     // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
     SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
     SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
@@ -674,13 +679,9 @@ struct Values {
                                                         Specialization::Default,
                                                         true,
                                                         true};
-    SwitchableSetting<bool> async_presentation{linkage,
-#ifdef __ANDROID__
-                                               true,
-#else
-                                               false,
-#endif
-                                               "async_presentation", Category::RendererHacks};
+    // On everywhere: the host frame pacer runs on the present thread.
+    SwitchableSetting<bool> async_presentation{linkage, true, "async_presentation",
+                                               Category::RendererHacks};
 
     SwitchableSetting<bool> fix_bloom_effects{linkage, false, "fix_bloom_effects",
                                                      Category::RendererHacks};
@@ -688,7 +689,8 @@ struct Values {
     SwitchableSetting<bool> emulate_bgr565{linkage, false, "emulate_bgr565",
                                             Category::RendererHacks};
 
-    SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
+    // On: draws whose pipeline is still compiling are skipped instead of freezing the game.
+    SwitchableSetting<bool> use_asynchronous_shaders{linkage, true, "use_asynchronous_shaders",
                                                      Category::RendererHacks};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,

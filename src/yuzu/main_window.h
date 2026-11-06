@@ -375,6 +375,8 @@ private slots:
     void OnMenuInstallToNAND();
     void OnMenuRecentFile();
     void OnConfigure();
+    /// Asks whether Ocarina of Time runs at 60 or 30 FPS (Settings::values.oot_30fps).
+    void AskOotFrameRate();
     void OnConfigureTas();
     void OnDecreaseVolume();
     void OnIncreaseVolume();
@@ -550,6 +552,7 @@ private:
 
     UserDataMigrator user_data_migrator;
     std::unique_ptr<QtConfig> config;
+    bool launched_with_game = false; ///< Started with a game path (skips the first-launch question)
 
     // Whether emulation is currently running in yuzu.
     bool emulation_running = false;
