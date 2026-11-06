@@ -203,8 +203,9 @@ struct Values {
 
     // Core
     SwitchableSetting<bool> use_multi_core{linkage, true, "use_multi_core", Category::Core};
+    // 8 GB: Ocarina of Time's own memory size (the Frizti builds are tuned for it).
     SwitchableSetting<MemoryLayout, true> memory_layout_mode{linkage,
-                                                             MemoryLayout::Memory_4Gb,
+                                                             MemoryLayout::Memory_8Gb,
                                                              "memory_layout_mode",
                                                              Category::Core,
                                                              Specialization::Default,
@@ -564,7 +565,8 @@ struct Values {
                                                            "vram_usage_mode",
                                                            Category::RendererAdvanced};
 
-    SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Cpu,
+    // GPU: Ocarina's cutscene videos.
+    SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Gpu,
                                                       "nvdec_emulation", Category::RendererAdvanced};
 
     SwitchableSetting<AnisotropyMode, true> max_anisotropy{linkage,
@@ -794,8 +796,9 @@ struct Values {
 
     Setting<s32> current_user{linkage, 0, "current_user", Category::System};
 
+    // Docked: the docked rendering resolution (as Ocarina of Time on a TV).
     SwitchableSetting<ConsoleMode> use_docked_mode{linkage,
-                                                   ConsoleMode::Handheld,
+                                                   ConsoleMode::Docked,
                                                    "use_docked_mode",
                                                    Category::System,
                                                    Specialization::Radio,
