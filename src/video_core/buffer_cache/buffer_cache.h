@@ -260,30 +260,30 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     };
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
                                            device_addr_end_aligned - device_addr_start_aligned);
-    // Mark only data that the GPU wrote. A mark stays for the session and sends later GPU writes
-    // in the range to a download at each fence.
-    // EDEN_NX2_PREFLUSH=0: keep trap-and-flush-on-read instead of marking the range, so a GPU
-    // write after a read queues no per-fence download. The mark is permanent, and Ocarina writes
-    // such a range ~190 times between reads, paying ~85 us of copying on every fence.
-    // Default off for Switch 2 titles, which read GPU-written buffers rarely: the permanent mark
-    // turned a few reads into a download on every one of their ~4500 fences a second. Other
-    // titles keep the old behaviour. EDEN_NX2_PREFLUSH=1/0 forces either way.
-    const bool preflush = [] {
+    // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
+    // instead keep read traps and flush on demand; EDEN_NX2_PREFLUSH=1 restores preflushing.
+    static const std::optional<bool> forced_preflush = []() -> std::optional<bool> {
         const char* value = std::getenv("EDEN_NX2_PREFLUSH");
         if (value != nullptr) {
             return value[0] != '0';
         }
-        return false;
+        return std::nullopt;
     }();
+    const bool preflush =
+        forced_preflush.value_or(!Tegra::g_nx2_ampere.load(std::memory_order_relaxed));
     if (!area->preemtive) {
-        cpu_read_ranges.Add(area->start_address, area->end_address - area->start_address);
-        download_cpu_read_ranges = true;
         if (preflush) {
             memory_tracker.MarkRegionAsPreflushable(
                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
         } else {
-            ArmReadTraps(device_addr_start_aligned,
-                         device_addr_end_aligned - device_addr_start_aligned);
+            if constexpr (USE_MEMORY_MAPS) {
+                cpu_read_ranges.Add(area->start_address, area->end_address - area->start_address);
+                download_cpu_read_ranges = true;
+            }
+            // The core consumed this trap before GetFlushArea. Forget it so the next GPU write
+            // really rearms the core instead of being skipped by the deduplication cache.
+            read_trapped_ranges.Subtract(
+                device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
         }
     } else {
         // The core keeps this area and has no mark. The next GPU write here must arm the range
