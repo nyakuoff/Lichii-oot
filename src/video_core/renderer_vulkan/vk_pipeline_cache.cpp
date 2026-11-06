@@ -14,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <thread>
@@ -1198,6 +1199,18 @@ void PipelineCache::EvictUnusedPipelines() {
     if (frame_count <= EvictAfterFrames) {
         return;
     }
+    // Only while the cache is large: each one evicted is translated again on the GPU thread when
+    // its place is revisited (~10 ms). Ocarina of Time kept ~1,900 of them and evicted 3,400 in
+    // 25 minutes of play, then rebuilt 1,850 (14 s of stalls, 3.8 s in one 10 s window). 8,000
+    // pipelines are ~3.6 GB of driver memory at most. EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
+    static const size_t evict_above = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : size_t{8000};
+    }();
+    if (graphics_cache.size() <= evict_above) {
+        return;
+    }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
     size_t evicted = 0;
@@ -1237,15 +1250,15 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
-    // EDEN_NX2_ASYNC_DISCARD=1: skip native draws whose pipeline is still building instead of
-    // waiting for it (experimental; the draw may be missing for a frame or more).
-    /// Reads EDEN_NX2_ASYNC_DISCARD once and logs when it is on.
+    // Native draws whose pipeline is still building are skipped instead of waited for (the
+    // object is missing for a frame or more rather than the game freezing while the driver
+    // compiles). Full-screen passes (no depth, few vertices) still wait, so a lighting or post
+    // pass is never dropped. EDEN_NX2_ASYNC_DISCARD=0 waits for every pipeline.
     static const bool discard_native = [] {
         const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
-        const bool enabled = value != nullptr && value[0] == '1';
-        if (enabled) {
-            LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws skip unbuilt pipelines");
-        }
+        const bool enabled = value == nullptr || value[0] != '0';
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws {} unbuilt pipelines",
+                 enabled ? "skip" : "wait for");
         return enabled;
     }();
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
