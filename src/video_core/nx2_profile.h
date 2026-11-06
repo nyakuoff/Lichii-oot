@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/cpu_features.h"
 #include "common/thread_cpu_clock.h"
+#include "common/nx2_timeline.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
@@ -146,7 +147,11 @@ inline thread_local ThreadData t_data;
 
 class Scope {
 public:
-    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
+    explicit Scope(Zone zone_)
+        : zone{zone_}, enabled{Enabled()}, timeline{Common::Nx2Timeline::Active()} {
+        if (timeline) {
+            timeline_start = Common::Nx2Timeline::Now();
+        }
         if (!enabled) {
             return;
         }
@@ -156,6 +161,10 @@ public:
     }
 
     ~Scope() {
+        if (timeline) {
+            Common::Nx2Timeline::Record(zone_names[static_cast<size_t>(zone)], timeline_start,
+                                        Common::Nx2Timeline::Now());
+        }
         if (!enabled) {
             return;
         }
@@ -173,8 +182,10 @@ public:
 private:
     Zone zone;
     bool enabled;
+    bool timeline;
     u64 start{};
     u64 parent_child_ns{};
+    u64 timeline_start{};
 };
 
 /// Amounts counted on the GPU thread, logged per second with the zones.

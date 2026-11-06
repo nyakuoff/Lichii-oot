@@ -18,6 +18,7 @@
 #include "common/scope_exit.h"
 #include "common/logging.h"
 #include "common/nx2_sampler.h"
+#include "common/nx2_timeline.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/stb.h"
@@ -379,6 +380,32 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+// Records what the emulator's threads do and wait for (common/nx2_timeline.h) and returns once
+// the Chrome trace is written.
+json Timeline(ToolState& state, const json& params) {
+    const double seconds = Param<double>(params, "seconds", 5.0, 0.1, 30.0);
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const auto path = state.dump_directory / fmt::format("timeline_{}.json", stamp);
+    if (!Common::Nx2Timeline::Start(path, seconds)) {
+        throw std::runtime_error{"a timeline recording is already running"};
+    }
+    const std::string expected = Common::FS::PathToUTF8String(path);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds + 30.0);
+    while (Common::Nx2Timeline::LastFile() != expected) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            throw std::runtime_error{"the timeline was not written in time"};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    std::error_code error;
+    return {{"file", expected},
+            {"seconds", seconds},
+            {"bytes", std::filesystem::file_size(path, error)}};
+}
+
 json SampleThreads(ToolState& state, const json& params) {
     const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
     const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
@@ -583,6 +610,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
         {"sample", handler(SampleThreads)},
+        {"timeline", handler(Timeline)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},

@@ -139,6 +139,16 @@ TOOLS = [
         },
     },
     {
+        "name": "timeline",
+        "description": "Records what the emulator's threads (guest present, GPU front and back, "
+                       "Vulkan worker) do and wait for, for the given seconds, and writes a "
+                       "Chrome trace (open in ui.perfetto.dev) to the dump directory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"seconds": {"type": "number", "minimum": 0.1, "maximum": 30}},
+        },
+    },
+    {
         "name": "read_memory",
         "description": "Reads up to 64 KiB of the game's guest virtual memory, read only and "
                        "while it runs. 'as' formats it: hex (default), u32, u64 (hex strings) or "
@@ -299,6 +309,8 @@ def default_timeout(name, params):
         return 120
     if name == "sample":
         return int(params.get("seconds", 10)) + 90
+    if name == "timeline":
+        return int(params.get("seconds", 5)) + 60
     if name in ("input", "input_sequence"):
         steps = params.get("steps", []) if name == "input_sequence" else [params]
         return sum(int(step.get("frames", 0)) for step in steps) // 20 + 10

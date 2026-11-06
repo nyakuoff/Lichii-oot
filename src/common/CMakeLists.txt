@@ -126,6 +126,8 @@ add_library(
     swap.h
     thread.cpp
     thread.h
+    nx2_timeline.cpp
+    nx2_timeline.h
     thread_cpu_clock.cpp
     thread_cpu_clock.h
     adpf.cpp
