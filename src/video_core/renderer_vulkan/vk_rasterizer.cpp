@@ -1384,7 +1384,16 @@ void RasterizerVulkan::DispatchCompute() {
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
     if (!pipeline) {
-        if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
+        if (kepler_compute->IsNativeMode()) {
+            // A program rejected before returns no pipeline without throwing (ComputeShader).
+            if (frame_dump.Capturing()) {
+                frame_dump.NoteSkipped(true,
+                                       kepler_compute->regs.code_loc.Address() +
+                                           kepler_compute->launch_description.program_start,
+                                       0, "rejected (cached)");
+            }
+            throw Shader::RuntimeError("Native compute pipeline unavailable");
+        }
         return;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
