@@ -206,6 +206,15 @@ public:
     /// writes only where they overlap), the compute and copy work and the work before the last
     /// host-level wait, all sent so far.
     bool WaitForMemoryWriters(DrainSite site, GPUVAddr begin, GPUVAddr end);
+    /// The ring position of everything sent so far.
+    [[nodiscard]] u64 SentPosition() const {
+        return write_position;
+    }
+    /// Whether work sent after position `since` may write [begin, end) (macro DMA read
+    /// snapshots): compute or copies, a host-level wait (draws before it may have written),
+    /// memory writes without a range, or a ranged write that overlaps. Also true when more
+    /// ranged writes were sent since than are remembered.
+    [[nodiscard]] bool MayBeWrittenSince(u64 since, GPUVAddr begin, GPUVAddr end) const;
 
 private:
     friend struct GpuSplitTestAccess;
@@ -295,6 +304,9 @@ private:
     };
     static constexpr size_t MaxRangedWrites = 256;
     std::deque<RangedWrite> ranged_writes;
+    /// The newest ranged writes, executed or not, for MayBeWrittenSince.
+    std::array<RangedWrite, MaxRangedWrites> recent_ranged_writes{};
+    u64 recent_ranged_count{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

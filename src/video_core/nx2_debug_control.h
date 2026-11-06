@@ -44,10 +44,19 @@ namespace VideoCore::Nx2Debug {
 /// measure how long each frame was shown.
 inline std::atomic<int> g_host_pace{-1};
 
+/// EDEN_NX2_DMA_SNAPSHOT (from EvilOOT's dma-snapshot fix): macro DMA reads of pages a drained
+/// read flushed whole skip the drain while nothing sent since may write them (Maxwell3D::
+/// FrontDmaRead). 9 = on (default: Lake Hylia 46.5 -> 52.3 fps; verify 0 differences in 235k
+/// reads), 10 = on and verify every skipped read against the drained path, 0 = off.
+inline std::atomic<int> g_dma_snapshot{-1};
+
 /// The live switch called `name`, or null.
 [[nodiscard]] inline std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "EDEN_NX2_HOST_PACE") {
         return &g_host_pace;
+    }
+    if (name == "EDEN_NX2_DMA_SNAPSHOT") {
+        return &g_dma_snapshot;
     }
     return nullptr;
 }

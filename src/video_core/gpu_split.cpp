@@ -144,6 +144,7 @@ void GpuSplit::Stop() {
     last_memory_write_position = 0;
     previous_memory_write_position = 0;
     ranged_writes.clear();
+    recent_ranged_count = 0;
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -258,6 +259,8 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end) {
             last.end = end;
             last.position = write_position;
             last.method = method;
+            // The deque's newest is the ring's newest too: both get every new write.
+            recent_ranged_writes[(recent_ranged_count - 1) % MaxRangedWrites] = last;
             return;
         }
     }
@@ -271,6 +274,25 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end) {
         ranged_writes.pop_front();
     }
     ranged_writes.push_back({write_position, begin, end, method});
+    recent_ranged_writes[recent_ranged_count++ % MaxRangedWrites] = ranged_writes.back();
+}
+
+bool GpuSplit::MayBeWrittenSince(u64 since, GPUVAddr begin, GPUVAddr end) const {
+    if ((std::max)({last_writer_position, last_sync_position, last_memory_write_position}) > since) {
+        return true;
+    }
+    const u64 remembered = (std::min<u64>)(recent_ranged_count, MaxRangedWrites);
+    for (u64 scanned = 0; scanned < remembered; ++scanned) {
+        const RangedWrite& write =
+            recent_ranged_writes[(recent_ranged_count - 1 - scanned) % MaxRangedWrites];
+        if (write.position <= since) {
+            return false;
+        }
+        if (write.begin < end && begin < write.end) {
+            return true;
+        }
+    }
+    return remembered == MaxRangedWrites;
 }
 
 bool GpuSplit::WaitForMemoryWriters(DrainSite site, GPUVAddr begin, GPUVAddr end) {

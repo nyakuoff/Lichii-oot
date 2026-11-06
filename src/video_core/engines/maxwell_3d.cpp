@@ -11,6 +11,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -25,6 +26,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -1048,6 +1050,10 @@ struct Maxwell3D::FrontState {
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
+    /// Macro DMA read snapshots (EDEN_NX2_DMA_SNAPSHOT, from EvilOOT's dma-snapshot fix): device
+    /// pages a drained read flushed whole, and the split position right after. Cleared past 8192
+    /// pages.
+    std::unordered_map<u64, u64> dma_snapshots;
 };
 
 namespace {
@@ -1466,6 +1472,110 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 VideoCommon::DrainSite::MacroDmaFlush);
         }
     };
+    // EDEN_NX2_DMA_SNAPSHOT (EvilOOT's dma-snapshot fix, ported from Frizti 8ac3666f7b): Ocarina
+    // reads an occlusion report for each object (macro 0xe2c, MME_DMA_READ_FIFOED), ~35,000 times
+    // a second, from GPU-written pages, and each read waited for the back. A drained read now
+    // flushes its whole device pages and remembers the split position; later reads of those
+    // pages skip the wait while nothing sent since may write them (GpuSplit::MayBeWrittenSince)
+    // and the query cache lists no report there. 10 also drains, reads again and logs
+    // differences; 0 turns it off.
+    const int snapshot_mode = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_dma_snapshot, "EDEN_NX2_DMA_SNAPSHOT", 9);
+    const auto flush_queries = [&](GPUVAddr begin, size_t bytes) {
+        split.Run(
+            [memory = &memory_manager, begin, bytes] {
+                memory->FlushRegion(begin, bytes, VideoCommon::CacheType::QueryCache);
+            },
+            VideoCommon::DrainSite::MacroDmaFlush);
+    };
+    if (snapshot_mode >= 9 && !full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
+        method == 0x158 && words != 0) {
+        const auto device = memory_manager.GpuToCpuAddress(source);
+        if (device &&
+            memory_manager.GpuToCpuAddress(source + read_bytes - 1) == *device + read_bytes - 1) {
+            static u64 hits{};
+            static u64 misses{};
+            static u64 differences{};
+            static u64 report_reads{};
+            static std::array<u64, 2> miss_reasons{};
+            const u64 first_page = *device >> 12;
+            const u64 last_page = (*device + read_bytes - 1) >> 12;
+            bool hit = true;
+            for (u64 page = first_page; page <= last_page && hit; ++page) {
+                const auto it = fs.dma_snapshots.find(page);
+                hit = it != fs.dma_snapshots.end() &&
+                      !split.MayBeWrittenSince(it->second, source, source + read_bytes);
+                if (!hit) {
+                    // No snapshot of the page, or work sent since may write it.
+                    ++miss_reasons[it == fs.dma_snapshots.end() ? 0 : 1];
+                }
+            }
+            // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
+            // listed report may not be in guest memory yet: take the drained path.
+            if (!hit || !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12)) {
+                thread_local std::vector<u32> snap_words;
+                snap_words.resize(words);
+                if (hit) {
+                    ++hits;
+                    memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                    if (snapshot_mode == 10) {
+                        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+                        flush_if_dirty();
+                        flush_queries(source, read_bytes);
+                        std::vector<u32> exact(words);
+                        memory_manager.ReadBlockUnsafe(source, exact.data(), read_bytes);
+                        if (exact != snap_words) {
+                            if (differences++ < 32) {
+                                LOG_WARNING(HW_GPU,
+                                            "DMA snapshot check: macro {:#x} read of {} words at "
+                                            "{:#x} differs from the drained read ({:#x} vs {:#x})",
+                                            macro, words, source, snap_words[0], exact[0]);
+                            }
+                            snap_words = std::move(exact);
+                        }
+                    }
+                } else {
+                    ++misses;
+                    // The GPU data of the whole pages (a flush of only the bytes read left stale
+                    // neighbours), the pending reports of the bytes read.
+                    const GPUVAddr flush_begin = source & ~GPUVAddr{0xfff};
+                    const GPUVAddr flush_end = (source + read_bytes + 0xfff) & ~GPUVAddr{0xfff};
+                    const size_t flush_bytes = static_cast<size_t>(flush_end - flush_begin);
+                    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+                    if (memory_manager.IsMemoryDirty(flush_begin, flush_bytes,
+                                                     VideoCommon::CacheType::BufferCache)) {
+                        split.Run(
+                            [memory = &memory_manager, flush_begin, flush_bytes] {
+                                memory->FlushRegion(flush_begin, flush_bytes,
+                                                    VideoCommon::CacheType::BufferCache);
+                            },
+                            VideoCommon::DrainSite::MacroDmaFlush);
+                    }
+                    flush_queries(source, read_bytes);
+                    if (fs.dma_snapshots.size() > 8192) {
+                        fs.dma_snapshots.clear();
+                    }
+                    for (u64 page = first_page; page <= last_page; ++page) {
+                        fs.dma_snapshots[page] = split.SentPosition();
+                    }
+                    memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                }
+                if (((hits + misses) & 0x3ffff) == 0) {
+                    LOG_INFO(HW_GPU,
+                             "DMA snapshot: {} reads skipped the wait, {} drained, {} differed, "
+                             "{} reads of listed reports (usual path); misses: {} new page, {} "
+                             "written since",
+                             hits, misses, differences, report_reads, miss_reasons[0],
+                             miss_reasons[1]);
+                }
+                for (u32 i = 0; i < words; ++i) {
+                    fs.parameters.push_back(snap_words[i]);
+                }
+                return;
+            }
+            ++report_reads;
+        }
+    }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
     if (full_drain) {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
