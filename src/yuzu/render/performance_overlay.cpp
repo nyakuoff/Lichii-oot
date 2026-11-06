@@ -10,9 +10,12 @@
 #include <QChart>
 #include <QChartView>
 #include <QGraphicsLayout>
+#include <QHBoxLayout>
+#include <QLabel>
 #include <QLineSeries>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QVBoxLayout>
 #include <QValueAxis>
 
 // TODO(crueter): Reset samples when user changes turbo, slow, etc.
@@ -33,6 +36,12 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
 
     m_fpsChart = new QChart;
     m_fpsChart->addSeries(m_fpsSeries);
+    m_outputSeries = new QLineSeries(this);
+    QPen outputPen(QColor(64, 224, 128));
+    outputPen.setWidth(2);
+    m_outputSeries->setPen(outputPen);
+    m_fpsChart->addSeries(m_outputSeries);
+    m_outputSeries->hide();
     m_fpsChart->legend()->hide();
     m_fpsChart->setBackgroundBrush(Qt::black);
     m_fpsChart->setBackgroundVisible(true);
@@ -63,6 +72,8 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     m_fpsChart->addAxis(m_fpsY, Qt::AlignLeft);
     m_fpsSeries->attachAxis(m_fpsX);
     m_fpsSeries->attachAxis(m_fpsY);
+    m_outputSeries->attachAxis(m_fpsX);
+    m_outputSeries->attachAxis(m_fpsY);
 
     // chart view
     m_fpsChartView = new QChartView(m_fpsChart, this);
@@ -70,6 +81,35 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     m_fpsChartView->setMinimumHeight(100);
 
     ui->verticalLayout->addWidget(m_fpsChartView, 1);
+
+    // Conditional output block, ported from Lichii #12 / Eglantine #254.
+    m_fgWidget = new QWidget(this);
+    auto* fgLayout = new QVBoxLayout(m_fgWidget);
+    fgLayout->setContentsMargins(0, 0, 0, 0);
+    auto* fgHeader = new QHBoxLayout;
+    auto* fgTitle = new QLabel(tr("Output FPS"), m_fgWidget);
+    fgTitle->setFont(ui->label_4->font());
+    fgTitle->setStyleSheet(QStringLiteral("color: #40e080;"));
+    m_fgFps = new QLabel(m_fgWidget);
+    m_fgFps->setFont(ui->fps->font());
+    fgHeader->addWidget(fgTitle);
+    fgHeader->addWidget(m_fgFps);
+    fgLayout->addLayout(fgHeader);
+
+    m_fgMode = new QLabel(m_fgWidget);
+    m_fgGenerated = new QLabel(m_fgWidget);
+    m_fgDropped = new QLabel(m_fgWidget);
+    m_fgPresent = new QLabel(m_fgWidget);
+    for (auto* label : {m_fgMode, m_fgGenerated, m_fgDropped, m_fgPresent}) {
+        label->setFont(ui->fps_min->font());
+        fgLayout->addWidget(label);
+    }
+    m_fgWidget->setToolTip(tr("Output counts successful Vulkan queue presents, not compositor "
+                            "scanout. Present times are intervals between those presents. "
+                            "Skipped counts planned generations omitted during warm-up; "
+                            "dropped counts generated frames discarded at presentation."));
+    ui->verticalLayout->insertWidget(ui->verticalLayout->indexOf(m_fpsChartView), m_fgWidget);
+    m_fgWidget->hide();
 
     // thanks Debian.
     QFont font = ui->fps->font();
@@ -95,6 +135,39 @@ void PerformanceOverlay::resetPosition(const QPoint& _) {
 
 void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
                                      const VideoCore::ShaderNotify& shaders) {
+    const auto& fg = results.frame_gen;
+    const bool frameGen = fg.mode.backend != VideoCore::FrameGen::Backend::Inactive;
+    if (frameGen != m_fgShown) {
+        if (frameGen) {
+            m_baseSize = size();
+        }
+        m_fgShown = frameGen;
+        m_fgWidget->setVisible(frameGen);
+        m_outputSeries->setVisible(frameGen);
+        ui->label_4->setText(frameGen ? tr("Base FPS") : tr("FPS"));
+        m_outputPoints.clear();
+        m_outputSeries->clear();
+        if (!frameGen) {
+            resize(m_baseSize);
+        }
+    }
+    if (frameGen) {
+        m_fgFps->setText(tr("%1 fps").arg(fg.output_fps, 0, 'f', 0));
+        const auto backend = fg.mode.backend == VideoCore::FrameGen::Backend::Fsr3
+                                 ? QStringLiteral("FSR3")
+                                 : QStringLiteral("LSFG");
+        m_fgMode->setText(fg.mode.target_rate
+                              ? tr("%1 target: %2 fps").arg(backend).arg(fg.mode.target_rate)
+                              : tr("%1 x%2").arg(backend).arg(fg.mode.multiplier));
+        m_fgGenerated->setText(tr("Generated: %1 fps").arg(fg.generated_fps, 0, 'f', 1));
+        m_fgDropped->setText(tr("Dropped: %1/s | Skipped: %2/s")
+                                 .arg(fg.dropped_fps, 0, 'f', 1)
+                                 .arg(fg.skipped_fps, 0, 'f', 1));
+        m_fgPresent->setText(tr("Present: %1 ms | Worst: %2 ms")
+                                 .arg(fg.average_present_ms, 0, 'f', 2)
+                                 .arg(fg.worst_present_ms, 0, 'f', 2));
+        adjustSize();
+    }
     auto fps = results.average_game_fps;
     if (!std::isnan(fps)) {
         // don't sample measurements < 3 fps because they are probably outliers or freezes
@@ -105,7 +178,13 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
         ui->fps->setText(fpsText);
 
         // sampling
-        if (fps > FPS_SAMPLE_THRESHOLD) {
+        if (fps > FPS_SAMPLE_THRESHOLD || frameGen) {
+            if (frameGen) {
+                m_outputPoints.emplace_back(m_xPos, fg.output_fps);
+                if (m_outputPoints.size() > NUM_FPS_SAMPLES) {
+                    m_outputPoints.pop_front();
+                }
+            }
             m_fpsSamples.push_back(fps);
             m_fpsPoints.push_back(QPointF{m_xPos++, fps});
         }
@@ -134,6 +213,14 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
             ui->fps_max->setText(tr("Max: %1").arg(max_fps, 0, 'f', 0));
 
             m_fpsSeries->replace(QList<QPointF>(m_fpsPoints.begin(), m_fpsPoints.end()));
+            if (frameGen) {
+                m_outputSeries->replace(
+                    QList<QPointF>(m_outputPoints.begin(), m_outputPoints.end()));
+                for (const auto& point : m_outputPoints) {
+                    max_fps = std::max(max_fps, point.y());
+                }
+                max_fps = std::max(1.0, max_fps);
+            }
 
             qreal x_min = std::max(0.0, m_xPos - NUM_FPS_SAMPLES);
             qreal x_max = std::max(qreal(10), m_xPos);

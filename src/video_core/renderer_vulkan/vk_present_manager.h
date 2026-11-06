@@ -13,6 +13,7 @@
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "video_core/frame_gen/stats.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -38,6 +39,9 @@ struct Frame {
     vk::Semaphore render_ready;
     vk::Fence present_done;
     bool storage_capable{};
+    bool generated{};
+    u32 skipped_generations{};
+    VideoCore::FrameGen::Mode frame_gen_mode{};
 };
 
 class PresentManager {
@@ -48,7 +52,8 @@ public:
                    MemoryAllocator& memory_allocator,
                    Scheduler& scheduler,
                    Swapchain& swapchain,
-                   vk::SurfaceKHR& surface);
+                   vk::SurfaceKHR& surface,
+                   VideoCore::FrameGen::Stats& frame_gen_stats);
     ~PresentManager();
 
     /// Returns the last used presentation frame
@@ -93,6 +98,7 @@ private:
     Scheduler& scheduler;
     Swapchain& swapchain;
     vk::SurfaceKHR& surface;
+    VideoCore::FrameGen::Stats& frame_gen_stats;
     vk::CommandPool cmdpool;
     std::vector<Frame> frames;
     boost::container::deque<Frame*> present_queue;

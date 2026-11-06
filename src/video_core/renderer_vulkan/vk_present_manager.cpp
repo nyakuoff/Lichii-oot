@@ -119,7 +119,8 @@ PresentManager::PresentManager(const vk::Instance& instance_,
                                MemoryAllocator& memory_allocator_,
                                Scheduler& scheduler_,
                                Swapchain& swapchain_,
-                               vk::SurfaceKHR& surface_)
+                               vk::SurfaceKHR& surface_,
+                               VideoCore::FrameGen::Stats& frame_gen_stats_)
     : instance{instance_}
     , render_window{render_window_}
     , device{device_}
@@ -127,6 +128,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , scheduler{scheduler_}
     , swapchain{swapchain_}
     , surface{surface_}
+    , frame_gen_stats{frame_gen_stats_}
     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
@@ -182,6 +184,10 @@ Frame* PresentManager::GetRenderFrame() {
     // Wait for the presentation to be finished so all frame resources are free
     frame->present_done.Wait();
     frame->present_done.Reset();
+
+    frame->generated = false;
+    frame->skipped_generations = 0;
+    frame->frame_gen_mode = {};
 
     return frame;
 }
@@ -378,6 +384,7 @@ void PresentManager::SetImageCount() {
 }
 
 void PresentManager::DiscardFrame(Frame* frame) {
+    frame_gen_stats.Dropped(frame->generated, frame->skipped_generations);
     static constexpr VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     const VkSemaphore render_ready = *frame->render_ready;
     const VkSubmitInfo submit_info{
@@ -588,7 +595,15 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
-    swapchain.Present(render_semaphore);
+    if (swapchain.Present(render_semaphore)) {
+        frame_gen_stats.Presented(frame->frame_gen_mode, frame->generated,
+                                  frame->skipped_generations,
+                                  frame->frame_gen_mode.backend == VideoCore::FrameGen::Backend::Inactive
+                                      ? VideoCore::FrameGen::Stats::Clock::time_point{}
+                                      : VideoCore::FrameGen::Stats::Clock::now());
+    } else {
+        frame_gen_stats.Dropped(frame->generated, frame->skipped_generations);
+    }
 }
 
 } // namespace Vulkan

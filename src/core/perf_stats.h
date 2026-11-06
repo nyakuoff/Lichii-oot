@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <mutex>
 #include "common/common_types.h"
+#include "video_core/frame_gen/stats.h"
 
 namespace Core {
 
@@ -21,6 +22,7 @@ struct PerfStatsResults {
     double frametime;
     /// Ratio of walltime / emulated time elapsed
     double emulation_speed;
+    VideoCore::FrameGen::StatsResults frame_gen{};
 };
 
 /**

@@ -263,6 +263,15 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
             dumped = true;
         }
     }
+
+    if (fsr3_chain && fsr3_chain->IsReady()) {
+        frame->frame_gen_mode.backend = VideoCore::FrameGen::Backend::Fsr3;
+    } else if (chain) {
+        frame->frame_gen_mode.backend = VideoCore::FrameGen::Backend::Lsfg;
+    }
+    frame->frame_gen_mode.multiplier = Settings::values.frame_gen_multiplier.GetValue();
+    frame->frame_gen_mode.target_rate = Settings::values.frame_gen_target_rate.GetValue();
+    frame->skipped_generations = generated ? 0 : static_cast<u32>(plan.generations);
 }
 
 size_t FrameGen::WantedGenerations(size_t capacity) {
@@ -288,6 +297,7 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
         scheduler.RequestOutsideRenderPassOperationContext();
         fsr3_chain->Generate(device, scheduler, *destination->image, *destination->storage_view,
                              blend, flow_scale);
+        destination->generated = fsr3_chain->IsReady();
     } else if (chain) {
         chain->SetTarget(device, last_generations, generation, destination->index,
                          *destination->storage_view);
@@ -301,6 +311,7 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
             chain->DispatchGeneration(cmdbuf, count, generation_count, generation, target, image,
                                       extent);
         });
+        destination->generated = true;
     }
 }
 

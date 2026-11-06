@@ -571,7 +571,12 @@ struct System::Impl {
         if (!perf_stats) {
             return {};
         }
-        return perf_stats->GetAndResetStats(core_timing.GetGlobalTimeUs());
+        auto results = perf_stats->GetAndResetStats(core_timing.GetGlobalTimeUs());
+        if (gpu_core) {
+            results.frame_gen = gpu_core->Renderer().GetFrameGenStats().Sample(
+                VideoCore::FrameGen::Stats::Clock::now());
+        }
+        return results;
     }
 
     Timing::CoreTiming core_timing;

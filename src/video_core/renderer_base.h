@@ -13,6 +13,7 @@
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "video_core/frame_gen/stats.h"
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -56,6 +57,10 @@ public:
 
     [[nodiscard]] f32 GetCurrentFPS() const {
         return m_current_fps;
+    }
+
+    [[nodiscard]] FrameGen::Stats& GetFrameGenStats() {
+        return frame_gen_stats;
     }
 
     [[nodiscard]] int GetCurrentFrame() const {
@@ -105,6 +110,7 @@ protected:
     int m_current_frame = 0;  ///< Current frame, should be set by the renderer
 
     RendererSettings renderer_settings;
+    FrameGen::Stats frame_gen_stats;
 
 private:
     /// Updates the framebuffer layout of the contained render window handle.

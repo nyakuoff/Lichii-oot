@@ -16,6 +16,7 @@ namespace Ui {
 class PerformanceOverlay;
 }
 
+class QLabel;
 class QLineSeries;
 class QChart;
 class QChartView;
@@ -57,6 +58,17 @@ private:
     qreal m_xPos = 0;
     std::deque<double> m_fpsSamples;
     std::deque<QPointF> m_fpsPoints;
+
+    QWidget* m_fgWidget = nullptr;
+    QLabel* m_fgFps = nullptr;
+    QLabel* m_fgMode = nullptr;
+    QLabel* m_fgGenerated = nullptr;
+    QLabel* m_fgDropped = nullptr;
+    QLabel* m_fgPresent = nullptr;
+    QLineSeries* m_outputSeries = nullptr;
+    std::deque<QPointF> m_outputPoints;
+    bool m_fgShown = false;
+    QSize m_baseSize;
 
     // drag
     QPoint m_drag_start_pos;
