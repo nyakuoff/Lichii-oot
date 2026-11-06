@@ -2034,7 +2034,10 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
     }
 }
 
+void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
+
 void RasterizerVulkan::TickFrame() {
+    NoteDrawReuseProbeFrame();
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
