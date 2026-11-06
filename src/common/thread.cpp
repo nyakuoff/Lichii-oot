@@ -6,8 +6,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common/adpf.h"
 #include "common/error.h"
@@ -546,6 +549,149 @@ void SetCurrentThreadToPerformanceCores() {
         return;
     }
     SetCurrentThreadCoreGroup(CoreGroup::Performance);
+#endif
+}
+
+void PinCurrentThread(PinnedRole role) {
+#ifdef _WIN32
+    // Off with EDEN_NX2_PIN_THREADS=0. On by default with 6 or more physical cores: the split's
+    // back did about 8% more draws a second at Lake Hylia (Ryzen 7 7800X3D), its worst window
+    // 29 -> 54 fps, once no SMT sibling shared its core.
+    static const char* const setting = std::getenv("EDEN_NX2_PIN_THREADS");
+    if (setting != nullptr && setting[0] == '0') {
+        return;
+    }
+    // Physical cores of processor group 0, as masks of their logical processors.
+    static const std::vector<KAFFINITY> cores = [] {
+        std::vector<KAFFINITY> result;
+        DWORD length = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+        std::vector<u8> buffer(length);
+        auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
+        if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
+            return result;
+        }
+        for (DWORD offset = 0; offset < length;) {
+            auto* entry =
+                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+            if (entry->Processor.GroupCount > 0 && entry->Processor.GroupMask[0].Group == 0) {
+                result.push_back(entry->Processor.GroupMask[0].Mask);
+            }
+            offset += entry->Size;
+        }
+        return result;
+    }();
+    // Core 0 takes most interrupts: the GPU threads get cores 1 and 2.
+    if (cores.size() < (setting != nullptr && setting[0] == '1' ? 4U : 6U)) {
+        return;
+    }
+    const KAFFINITY front = cores[1];
+    const KAFFINITY back = cores[2];
+    KAFFINITY mask{};
+    switch (role) {
+    case PinnedRole::GpuFront:
+        mask = front;
+        break;
+    case PinnedRole::GpuBack:
+        mask = back;
+        break;
+    case PinnedRole::GuestCore:
+        for (const KAFFINITY core : cores) {
+            mask |= core;
+        }
+        mask &= ~(front | back);
+        break;
+    }
+    if (mask != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+    }
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // Same policy as Windows: physical cores from sysfs, in order of their first logical CPU,
+    // limited to the CPUs this process may use (taskset, cgroups).
+    static const char* const setting = std::getenv("EDEN_NX2_PIN_THREADS");
+    if (setting != nullptr && setting[0] == '0') {
+        return;
+    }
+    static const std::vector<std::vector<int>> cores = [] {
+        std::vector<std::vector<int>> result;
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+            return result;
+        }
+        std::vector<bool> seen(CPU_SETSIZE);
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &allowed) || seen[cpu]) {
+                continue;
+            }
+            std::vector<int> siblings;
+            const std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                                     "/topology/thread_siblings_list";
+            if (std::FILE* file = std::fopen(path.c_str(), "r")) {
+                char line[256]{};
+                if (std::fgets(line, sizeof(line), file)) {
+                    // A list like "2-3" or "2,3" or "16".
+                    for (char* cursor = line; *cursor != '\0' && *cursor != '\n';) {
+                        char* end = nullptr;
+                        const long first = std::strtol(cursor, &end, 10);
+                        if (end == cursor) {
+                            break;
+                        }
+                        long last = first;
+                        if (*end == '-') {
+                            cursor = end + 1;
+                            last = std::strtol(cursor, &end, 10);
+                        }
+                        for (long sibling = first; sibling <= last && sibling < CPU_SETSIZE;
+                             ++sibling) {
+                            siblings.push_back(static_cast<int>(sibling));
+                        }
+                        cursor = *end == ',' ? end + 1 : end;
+                    }
+                }
+                std::fclose(file);
+            }
+            if (siblings.empty()) {
+                siblings.push_back(cpu);
+            }
+            std::erase_if(siblings, [&](int sibling) { return !CPU_ISSET(sibling, &allowed); });
+            for (const int sibling : siblings) {
+                seen[sibling] = true;
+            }
+            if (!siblings.empty()) {
+                result.push_back(std::move(siblings));
+            }
+        }
+        return result;
+    }();
+    if (cores.size() < (setting != nullptr && setting[0] == '1' ? 4U : 6U)) {
+        return;
+    }
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    const auto add = [&mask](const std::vector<int>& core) {
+        for (const int cpu : core) {
+            CPU_SET(cpu, &mask);
+        }
+    };
+    switch (role) {
+    case PinnedRole::GpuFront:
+        add(cores[1]);
+        break;
+    case PinnedRole::GpuBack:
+        add(cores[2]);
+        break;
+    case PinnedRole::GuestCore:
+        for (size_t i = 0; i < cores.size(); ++i) {
+            if (i != 1 && i != 2) {
+                add(cores[i]);
+            }
+        }
+        break;
+    }
+    if (CPU_COUNT(&mask) != 0) {
+        sched_setaffinity(0, sizeof(mask), &mask);
+    }
 #endif
 }
 
