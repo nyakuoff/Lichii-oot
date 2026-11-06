@@ -230,11 +230,20 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     return false;
 }
 
-bool Swapchain::Present(VkSemaphore render_semaphore) {
+std::optional<u64> Swapchain::Present(VkSemaphore render_semaphore) {
     const auto present_queue{device.GetPresentQueue()};
+    // Ids for vkWaitForPresentKHR (the host frame pacer). They only have to increase per
+    // swapchain, so one counter serves every swapchain this object creates.
+    const u64 present_id = device.IsKhrPresentWaitSupported() ? ++next_present_id : 0;
+    const VkPresentIdKHR present_id_info{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
+        .pNext = nullptr,
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .pNext = nullptr,
+        .pNext = present_id != 0 ? &present_id_info : nullptr,
         .waitSemaphoreCount = render_semaphore ? 1U : 0U,
         .pWaitSemaphores = &render_semaphore,
         .swapchainCount = 1,
@@ -243,12 +252,14 @@ bool Swapchain::Present(VkSemaphore render_semaphore) {
         .pResults = nullptr,
     };
     std::scoped_lock lock{scheduler.submit_mutex};
-    const VkResult result = present_queue.Present(present_info);
-    switch (result) {
+    bool queued = false;
+    switch (const VkResult result = present_queue.Present(present_info)) {
     case VK_SUCCESS:
+        queued = true;
         break;
     case VK_SUBOPTIMAL_KHR:
         LOG_DEBUG(Render_Vulkan, "Suboptimal swapchain");
+        queued = true;
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
         is_outdated = true;
@@ -264,7 +275,7 @@ bool Swapchain::Present(VkSemaphore render_semaphore) {
     if (frame_index >= image_count) {
         frame_index = 0;
     }
-    return result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
+    return queued ? std::optional<u64>{present_id} : std::nullopt;
 }
 
 void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {

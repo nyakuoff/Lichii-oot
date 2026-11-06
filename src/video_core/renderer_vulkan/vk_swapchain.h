@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include <vector>
 
 #include "common/common_types.h"
@@ -41,8 +43,17 @@ public:
     /// `may_flush`: false on the async present thread (see Scheduler::Wait).
     bool AcquireNextImage(bool may_flush = true);
 
-    /// Presents the rendered image to the swapchain.
-    bool Present(VkSemaphore render_semaphore);
+    /// Presents the rendered image to the swapchain. Returns its present id for
+    /// vkWaitForPresentKHR (0 without present wait support), or nullopt if the present failed.
+    std::optional<u64> Present(VkSemaphore render_semaphore);
+
+    VkSwapchainKHR Handle() const {
+        return *swapchain;
+    }
+
+    VkPresentModeKHR PresentMode() const {
+        return present_mode;
+    }
 
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {
@@ -142,6 +153,7 @@ private:
 
     u32 image_index{};
     u32 frame_index{};
+    u64 next_present_id{};
 
     VkFormat image_view_format{};
     VkExtent2D extent{};
