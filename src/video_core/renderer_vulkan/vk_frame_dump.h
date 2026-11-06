@@ -53,6 +53,7 @@ public:
     [[nodiscard]] bool Sampled() const noexcept {
         return sampled;
     }
+    /// Whether the uniform and storage buffers and dispatch group counts are recorded.
     [[nodiscard]] bool Buffers() const noexcept {
         return buffers;
     }
@@ -88,8 +89,10 @@ private:
 /// the frame, in seconds after boot ("45") or as a frame number ("2700f").
 /// EDEN_NX2_FRAME_DUMP_SAMPLED=1 also reads back every texture a pass samples (3D and depth
 /// included), once per pass, as the first draw sampling it sees it, and the textures each compute
-/// shader samples, once per shader, before its first dispatch. Readbacks are encoded and written on
-/// a worker thread so the capture does not stall the game.
+/// shader samples, once per shader, before its first dispatch, with each texture's sampler state,
+/// and the uniform and storage buffers of every draw and dispatch, once per shader and binding, with
+/// each dispatch's group counts. Readbacks are encoded and written on a worker thread so the
+/// capture does not stall the game.
 class FrameDump {
 public:
     struct Sampled {
@@ -136,8 +139,11 @@ public:
     bool NoteSampled(std::span<const Sampled> textures);
     /// Reads back the textures of the dispatch about to run not yet seen for this shader.
     void NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> textures);
+    /// Records the buffers of the current draw (shader hashes by program) or of the dispatch about
+    /// to run not yet seen for their shader. Returns true when copies were recorded.
     bool NoteBuffers(bool compute, std::span<const u64> shader_hashes,
                      std::span<BoundBuffer> buffers);
+    /// Records the group counts of the dispatch about to run.
     void NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
                     const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
                     std::optional<std::array<u32, 3>> indirect_grid);
@@ -175,6 +181,7 @@ private:
         DepthEncoding depth_encoding;
     };
 
+    /// An image readback, or a buffer one (`raw`) of `bytes` bytes.
     struct Readback {
         vk::Buffer buffer;
         Target target;
@@ -184,7 +191,8 @@ private:
         size_t bytes{};
     };
 
-    /// Work for the writer thread: a readback (`name` set), a finished manifest line, or the summary.
+    /// Work for the writer thread: an image readback (`name` set), buffer bytes (`raw`), a
+    /// finished manifest line, or the summary.
     struct Job {
         Target target{};
         std::string name;
