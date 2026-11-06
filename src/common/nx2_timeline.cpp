@@ -36,8 +36,11 @@ struct ThreadBuffer {
     std::string name;
 };
 
-// At most this many spans per thread and recording (the GPU threads make ~200,000 a second).
-constexpr size_t MaxEvents = size_t{1} << 21;
+// At most this many spans per thread and recording (the GPU threads make ~200,000 a second,
+// the front's macros over a million: consecutive spans of one name merge, see Record).
+constexpr size_t MaxEvents = size_t{1} << 22;
+// Spans of the same name closer than this merge into one.
+constexpr u64 MergeGapNs = 2000;
 
 std::mutex g_registry_mutex;
 std::vector<std::shared_ptr<ThreadBuffer>> g_buffers;
@@ -167,7 +170,19 @@ u64 Now() {
 void Record(const char* name, u64 begin_ns, u64 end_ns) {
     ThreadBuffer& buffer = Buffer();
     std::scoped_lock lock{buffer.mutex};
-    if (buffer.events.size() < MaxEvents && Active()) {
+    if (!Active()) {
+        return;
+    }
+    if (!buffer.events.empty()) {
+        Event& last = buffer.events.back();
+        const u64 last_end = last.begin + last.duration;
+        if (last.name == name && last.duration != 0 && begin_ns >= last_end &&
+            begin_ns - last_end < MergeGapNs) {
+            last.duration = end_ns - last.begin;
+            return;
+        }
+    }
+    if (buffer.events.size() < MaxEvents) {
         buffer.events.push_back({begin_ns, (std::max)(end_ns - begin_ns, u64{1}), name});
     }
 }
