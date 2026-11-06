@@ -1366,7 +1366,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 });
             } else {
                 count = std::min(count, sampled_dynamic_cap);
-                // Depth-comparison instructions always sample floating-point depth.
+                // Depth-compare sampling returns a float in Vulkan, so its image must be float
+                // even when a garbage or unknown descriptor reads as an integer format.
                 const bool is_integer{flags.is_depth == 0 && is_texture_pixel_format_integer(cbuf)};
                 index = descriptors.Add(TextureDescriptor{
                     .type = flags.type,
