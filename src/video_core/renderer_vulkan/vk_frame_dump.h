@@ -198,9 +198,9 @@ private:
         std::string name;
         std::string tags;
         std::vector<u8> data;
+        bool raw{};
         bool summary{};
         bool truncated{};
-        bool raw{};
         u64 capture_id{};
     };
 
