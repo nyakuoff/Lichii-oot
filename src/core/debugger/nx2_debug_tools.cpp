@@ -388,7 +388,7 @@ json Timeline(ToolState& state, const json& params) {
                            std::chrono::system_clock::now().time_since_epoch())
                            .count();
     const auto path = state.dump_directory / fmt::format("timeline_{}.json", stamp);
-    if (!Common::Nx2Timeline::Start(path, seconds)) {
+    if (!Common::Nx2Timeline::Start(path, seconds, params.value("detail", false))) {
         throw std::runtime_error{"a timeline recording is already running"};
     }
     const std::string expected = Common::FS::PathToUTF8String(path);

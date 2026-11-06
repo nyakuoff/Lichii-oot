@@ -18,6 +18,13 @@
 namespace Common::Nx2Timeline {
 
 inline std::atomic<bool> g_active{false};
+/// Fine-grained spans (per-draw stages, per-method calls) are recorded only with detail on: they
+/// are about ten per draw and slow the GPU threads by a third while recording.
+inline std::atomic<bool> g_detail{false};
+
+[[nodiscard]] inline bool Detail() {
+    return g_detail.load(std::memory_order_relaxed);
+}
 
 [[nodiscard]] inline bool Active() {
     return g_active.load(std::memory_order_relaxed);
@@ -32,8 +39,9 @@ void Record(const char* name, u64 begin_ns, u64 end_ns);
 /// Records a zero-length marker on the calling thread.
 void Instant(const char* name);
 
-/// Starts a recording of `seconds` written to `path`. False if one is already running.
-bool Start(const std::filesystem::path& path, double seconds);
+/// Starts a recording of `seconds` written to `path` (`detail`: the fine-grained spans too).
+/// False if one is already running.
+bool Start(const std::filesystem::path& path, double seconds, bool detail = false);
 
 /// The file the last recording wrote ("" until one finished), and whether one is running.
 [[nodiscard]] std::string LastFile();

@@ -145,7 +145,9 @@ TOOLS = [
                        "Chrome trace (open in ui.perfetto.dev) to the dump directory.",
         "inputSchema": {
             "type": "object",
-            "properties": {"seconds": {"type": "number", "minimum": 0.1, "maximum": 30}},
+            "properties": {"seconds": {"type": "number", "minimum": 0.1, "maximum": 30},
+                           "detail": {"type": "boolean",
+                                      "description": "Also per-draw stages and method calls (slows the GPU threads)"}},
         },
     },
     {

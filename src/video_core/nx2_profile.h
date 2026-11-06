@@ -145,10 +145,37 @@ struct ThreadData {
 
 inline thread_local ThreadData t_data;
 
+/// The zones a timeline records without detail: waits, whole draws, dispatches and macros.
+[[nodiscard]] constexpr bool IsCoarse(Zone zone) {
+    switch (zone) {
+    case Zone::Idle:
+    case Zone::PendingSleep:
+    case Zone::ResumePending:
+    case Zone::Push:
+    case Zone::Macro:
+    case Zone::Draw:
+    case Zone::Clear:
+    case Zone::Compute:
+    case Zone::FlushWork:
+    case Zone::TextureUpload:
+    case Zone::Fence:
+    case Zone::SplitDrain:
+    case Zone::SplitWait:
+    case Zone::WriterWait:
+    case Zone::ListSubmitWait:
+    case Zone::ListGpuWait:
+        return true;
+    default:
+        return false;
+    }
+}
+
 class Scope {
 public:
     explicit Scope(Zone zone_)
-        : zone{zone_}, enabled{Enabled()}, timeline{Common::Nx2Timeline::Active()} {
+        : zone{zone_}, enabled{Enabled()},
+          timeline{Common::Nx2Timeline::Active() &&
+                   (Common::Nx2Timeline::Detail() || IsCoarse(zone_))} {
         if (timeline) {
             timeline_start = Common::Nx2Timeline::Now();
         }

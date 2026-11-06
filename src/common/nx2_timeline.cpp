@@ -198,7 +198,7 @@ void Instant(const char* name) {
     }
 }
 
-bool Start(const std::filesystem::path& path, double seconds) {
+bool Start(const std::filesystem::path& path, double seconds, bool detail) {
     if (g_running.exchange(true)) {
         return false;
     }
@@ -211,6 +211,7 @@ bool Start(const std::filesystem::path& path, double seconds) {
         }
     }
     g_start_ns = Now();
+    g_detail.store(detail, std::memory_order_relaxed);
     g_active.store(true, std::memory_order_release);
     LOG_INFO(Debug, "Timeline: recording {:.1f} s", seconds);
     std::thread([path, seconds] {
@@ -250,11 +251,12 @@ void OnPresent() {
     started = true;
     const char* value = std::getenv("EDEN_NX2_TIMELINE_SECONDS");
     const double seconds = value != nullptr ? std::atof(value) : 5.0;
+    const char* detail = std::getenv("EDEN_NX2_TIMELINE_DETAIL");
     Start(std::filesystem::path{directory} /
               fmt::format("timeline_{}.json", std::chrono::duration_cast<std::chrono::seconds>(
                                                   std::chrono::system_clock::now().time_since_epoch())
                                                   .count()),
-          seconds);
+          seconds, detail != nullptr && detail[0] == '1');
 }
 
 } // namespace Common::Nx2Timeline
