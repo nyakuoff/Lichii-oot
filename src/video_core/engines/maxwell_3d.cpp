@@ -339,6 +339,9 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
 }
 
 void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
+        ReleaseFront();
+    }
     const auto control = shadow_state.shadow_ram_control;
     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
     // CallMethod does.
@@ -486,6 +489,9 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
 }
 
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
+        ReleaseFront();
+    }
     if (!fast_maxwell3d || executing_macro != 0 || method >= MacroRegistersStart ||
         method == MAXWELL3D_REG_INDEX(shadow_ram_control)) {
         return CallMethodSlow(system, method, method_argument, is_last_call);
@@ -718,6 +724,9 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
 }
 
 void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
+    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
+        ReleaseFront();
+    }
     RecordWrite(method, amount ? base_start[0] : 0, amount, methods_pending);
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
@@ -1131,6 +1140,19 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
     return *front;
 }
 
+// With the split on, engine methods run on its back only: one here on another thread means the
+// split stopped (accuracy settings changed mid-game). Hand the macros back: the front's copy
+// goes stale from now on, and a restart copies the registers again (Front).
+void Maxwell3D::ReleaseFront() {
+    executing_macro = front->executing_macro;
+    macro_params = std::move(front->parameters);
+    std::memcpy(shadow_state.reg_array.data(), front->shadow.data(), sizeof(front->shadow));
+    shadow_state.shadow_ram_control = front->control;
+    front.reset();
+    front_macros = false;
+    LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
+}
+
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -1268,17 +1290,6 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
-    // The instance loop state the back ends in (Replay: it acts on the shadow copy). The back
-    // runs draw.begin once per word, so each word can switch the loop; other methods leave it
-    // as their last word does.
-    const bool replay = fs.control == Regs::ShadowRamControl::Replay;
-    if (method == MAXWELL3D_REG_INDEX(draw.begin)) {
-        for (u32 i = 0; i < amount; ++i) {
-            FrontTrackInstanceLoop(fs, method, replay ? fs.shadow[method] : base_start[i]);
-        }
-    } else if (amount != 0) {
-        FrontTrackInstanceLoop(fs, method, replay ? fs.shadow[method] : base_start[amount - 1]);
-    }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto [write_begin, write_end] = FrontWriteRange(fs, method, amount);
@@ -1294,6 +1305,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 method == MAXWELL3D_REG_INDEX(inline_index_2x16.even) ||
                 method == MAXWELL3D_REG_INDEX(inline_index_4x8.index0)) &&
                fs.control != Regs::ShadowRamControl::Replay) {
+        FrontTrackInstanceLoop(fs, method, 0);
         if (amount != 0) {
             const u32 last = base_start[amount - 1];
             if (tracked()) {
@@ -1318,6 +1330,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 value = fs.shadow[method];
             }
             fs.regs[method] = value;
+            FrontTrackInstanceLoop(fs, method, value); // DrawBegin runs for every word
             if (!execution_mask[method]) {
                 continue;
             }
@@ -1483,8 +1496,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         VideoCore::Nx2Debug::g_dma_snapshot, "EDEN_NX2_DMA_SNAPSHOT", 9);
     const auto flush_queries = [&](GPUVAddr begin, size_t bytes) {
         split.Run(
-            [memory = &memory_manager, begin, bytes] {
-                memory->FlushRegion(begin, bytes, VideoCommon::CacheType::QueryCache);
+            [this, begin, bytes] {
+                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, begin, bytes);
             },
             VideoCommon::DrainSite::MacroDmaFlush);
     };
@@ -1611,13 +1624,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         split.Drain(VideoCommon::DrainSite::MacroDmaCheck);
         flush_if_dirty();
     }
-    // Reports and semaphore writes held in the query cache are written out (and waited on
-    // through the fence manager) on the thread that owns it: without this, macro DMA reads of
-    // occlusion reports return stale counts and the guest culls visible objects. The non-split
-    // path in macro.cpp has the matching flush.
+    // Write out the reports held in the query cache, or the read returns stale occlusion counts.
     split.Run(
-        [memory = &memory_manager, source, read_bytes] {
-            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+        [this, source, read_bytes] {
+            VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
         },
         VideoCommon::DrainSite::MacroDmaFlush);
     u32 changed{};

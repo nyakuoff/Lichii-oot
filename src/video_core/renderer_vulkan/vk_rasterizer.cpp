@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -1110,7 +1111,7 @@ void RasterizerVulkan::DrawTexture() {
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
 
-    UpdateDynamicStates();
+    UpdateDynamicStates(nullptr);
 
     query_cache.NotifySegment(true);
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
@@ -1602,7 +1603,11 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 }
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
-    if ((True(which & VideoCommon::CacheType::BufferCache)) && MayBeGpuModified(addr, size)) {
+    // The split's front asks this before each macro DMA read, and the back holds the buffer
+    // cache's lock through each draw: pages the GPU never wrote need no look under it.
+    if (True(which & VideoCommon::CacheType::BufferCache) &&
+        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+         Tegra::Nx2MayBeGpuWritten(addr, size))) {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
@@ -1614,23 +1619,6 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         return texture_cache.IsRegionGpuModified(addr, size);
-    }
-    return false;
-}
-
-bool RasterizerVulkan::MayBeGpuModified(DAddr addr, u64 size) {
-    // Every range the buffer cache records as GPU-modified also marks its pages GPU-written
-    // (bits that never clear), so pages without the bit need no look under its mutex. The split's
-    // front asks this before each macro DMA read; the back holds the mutex through each draw.
-    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
-        return true;
-    }
-    const DAddr last = addr + size - 1;
-    for (DAddr page = addr >> Tegra::Nx2WrittenPageBits; page <= (last >> Tegra::Nx2WrittenPageBits);
-         ++page) {
-        if (Tegra::Nx2IsGpuWritten(page << Tegra::Nx2WrittenPageBits)) {
-            return true;
-        }
     }
     return false;
 }
@@ -1818,6 +1806,27 @@ void RasterizerVulkan::SignalReference() {
 
 void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
+}
+
+void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
+    // queued behind the pending report writes instead. On the split's back the fence's
+    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    bool written{};
+    fence_manager.SyncOperation([&] {
+        std::scoped_lock lock{wait_mutex};
+        written = true;
+        wait_cv.notify_all();
+    });
+    fence_manager.SignalFence([] {});
+    scheduler.FlushDeferred();
+    std::unique_lock lock{wait_mutex};
+    wait_cv.wait(lock, [&written] { return written; });
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
@@ -2391,7 +2400,7 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
 }
 
-void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* draw_pipeline) {
+void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
     auto& regs = maxwell3d->regs;
     auto& flags = maxwell3d->dirty.flags;
     const auto topology = maxwell3d->draw_manager.draw_state.topology;
@@ -2463,15 +2472,15 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* draw_pipeline) {
     }
 
     if (device.IsExtExtendedDynamicState3BlendingSupported()) {
-        UpdateBlending(regs);
+        UpdateBlending(regs, pipeline);
     } else if (device.IsExtColorWriteEnableSupported()) {
         UpdateColorWriteEnable(regs);
     }
 
     if (device.IsExtVertexInputDynamicStateSupported()) {
         // A draw passes the pipeline it looked up: a second lookup was ~2.5% of the back thread.
-        GraphicsPipeline* const gp =
-            draw_pipeline != nullptr ? draw_pipeline : pipeline_cache.CurrentGraphicsPipeline();
+        const GraphicsPipeline* const gp =
+            pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
         if (gp && gp->HasDynamicVertexInput()) {
             UpdateVertexInput(regs);
         }
@@ -3105,12 +3114,18 @@ void RasterizerVulkan::UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs) {
     scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetLogicOpEXT(op); });
 }
 
-void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchBlending()) {
+void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
+                                      const GraphicsPipeline* pipeline) {
+    // The write mask also excludes components the fragment shader doesn't output, so it has to be
+    // recorded again whenever the bound pipeline outputs a different set of components.
+    const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
+    const bool color_output_changed = color_output_mask != last_color_output_mask;
+    if (!state_tracker.TouchBlending() && !color_output_changed) {
         return;
     }
 
-    if (state_tracker.TouchColorMask()) {
+    if (state_tracker.TouchColorMask() || color_output_changed) {
+        last_color_output_mask = color_output_mask;
         std::array<VkColorComponentFlags, Maxwell::NumRenderTargets> setup_masks{};
         for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
             const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
@@ -3127,6 +3142,7 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs) {
             if (mask.A) {
                 current |= VK_COLOR_COMPONENT_A_BIT;
             }
+            current &= (color_output_mask >> (index * 4)) & 0xF;
         }
         scheduler.Record([setup_masks](vk::CommandBuffer cmdbuf) {
             cmdbuf.SetColorWriteMaskEXT(0, setup_masks);

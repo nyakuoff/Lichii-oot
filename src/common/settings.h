@@ -201,6 +201,9 @@ struct Values {
     Setting<bool, false> dump_audio_commands{
                                              linkage, false, "dump_audio_commands", Category::Audio, Specialization::Default, false};
 
+    Setting<u16, true> microphone_volume{linkage, 100, 0, 200, "microphone_volume",
+                                        Category::Controls};
+
     // Core
     SwitchableSetting<bool> use_multi_core{linkage, true, "use_multi_core", Category::Core};
     // 8 GB: Ocarina of Time's own memory size (the Frizti builds are tuned for it).
@@ -715,6 +718,9 @@ struct Values {
 
     SwitchableSetting<bool> gpu_unswizzle_enabled{linkage, false, "gpu_unswizzle_enabled",
                                                   Category::RendererHacks};
+
+    SwitchableSetting<bool> pin_gpu_threads{linkage, true, "pin_gpu_threads",
+                                            Category::RendererHacks};
 
     SwitchableSetting<ExtendedDynamicState> dyna_state{linkage,
 #if defined(__ANDROID__)

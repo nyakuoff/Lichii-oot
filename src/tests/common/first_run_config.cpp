@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -13,8 +14,8 @@ namespace {
 
 class FileConfig final : public Config {
 public:
-    explicit FileConfig(const std::string& name, ConfigType type = ConfigType::GlobalConfig)
-        : Config{type} {
+    explicit FileConfig(const std::string& name, ConfigType config_type = ConfigType::GlobalConfig)
+        : Config{config_type} {
         Initialize(name);
     }
 
@@ -91,13 +92,13 @@ void CheckFreshProfile() {
     CHECK(values.use_asynchronous_shaders.GetValue());
 }
 
-void CheckLegacyProfile() {
+void CheckBaseProfile() {
     const auto& values = Settings::values;
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
-    CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
-    CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Cpu);
-    CHECK_FALSE(values.async_presentation.GetValue());
-    CHECK_FALSE(values.use_asynchronous_shaders.GetValue());
+    CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
+    CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
+    CHECK(values.async_presentation.GetValue());
+    CHECK(values.use_asynchronous_shaders.GetValue());
 }
 
 void CheckUnchangedProfile() {
@@ -110,8 +111,8 @@ void CheckUnchangedProfile() {
     CHECK(values.slow_speed_limit.GetValue() == 50);
     CHECK(values.turbo_speed_limit.GetValue() == 200);
     CHECK_FALSE(values.sync_core_speed.GetValue());
-    CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_4Gb);
-    CHECK(values.vsync_mode.GetValue() == Settings::VSyncMode::Fifo);
+    CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_8Gb);
+    CHECK(values.vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
     CHECK(values.fsr_sharpening_slider.GetValue() == 25);
     CHECK(values.dma_accuracy.GetValue() == Settings::DmaAccuracy::Default);
     CHECK(values.gpu_fence_behavior.GetValue() == Settings::GpuFenceBehavior::Default);
@@ -136,6 +137,7 @@ void CheckUnchangedProfile() {
     CHECK(values.gpu_unswizzle_stream_size.GetValue() == Settings::GpuUnswizzle::Medium);
     CHECK(values.gpu_unswizzle_chunk_size.GetValue() == Settings::GpuUnswizzleChunk::Medium);
     CHECK_FALSE(values.gpu_unswizzle_enabled.GetValue());
+    CHECK(values.pin_gpu_threads.GetValue());
     CHECK(values.dyna_state.GetValue() == values.dyna_state.GetDefault());
     CHECK(values.sample_shading.GetValue() == 0);
     CHECK(values.vertex_input_dynamic_state.GetValue());
@@ -169,9 +171,15 @@ TEST_CASE("Absent global config receives the first-run profile and persists it",
                                std::istreambuf_iterator<char>{}};
     REQUIRE(saved.LoadData(contents) >= 0);
     file.close();
-    for (const char* key : {"scaling_filter", "gpu_accuracy", "nvdec_emulation",
-                            "async_presentation", "use_asynchronous_shaders"}) {
-        CHECK_FALSE(saved.GetBoolValue("Renderer", (std::string{key} + "\\default").c_str(), true));
+    const std::array<const Settings::BasicSetting*, 5> seeded{
+        &Settings::values.scaling_filter, &Settings::values.gpu_accuracy,
+        &Settings::values.nvdec_emulation, &Settings::values.async_presentation,
+        &Settings::values.use_asynchronous_shaders};
+    for (const auto* setting : seeded) {
+        const auto key = setting->GetLabel() + "\\default";
+        REQUIRE(saved.GetValue("Renderer", key.c_str()) != nullptr);
+        CHECK(saved.GetBoolValue("Renderer", key.c_str()) ==
+              (setting->ToString() == setting->DefaultToString()));
     }
     const auto filename = config->GetConfigFilePath();
     config.reset();
@@ -189,7 +197,8 @@ TEST_CASE("Existing explicit settings survive load save and reopen", "[config]")
                     "gpu_accuracy={}\ngpu_accuracy\\default=false\n"
                     "nvdec_emulation={}\nnvdec_emulation\\default=false\n"
                     "async_presentation=false\nasync_presentation\\default=false\n"
-                    "use_asynchronous_shaders=false\nuse_asynchronous_shaders\\default=false\n"
+                     "use_asynchronous_shaders=false\nuse_asynchronous_shaders\\default=false\n"
+                     "pin_gpu_threads=false\npin_gpu_threads\\default=false\n"
                     "fsr_sharpening_slider=83\nfsr_sharpening_slider\\default=false\n"
                     "[System]\nfast_gpu_time={}\nfast_gpu_time\\default=false\n",
                     u32(Settings::ScalingFilter::Bilinear), u32(Settings::GpuAccuracy::High),
@@ -201,12 +210,13 @@ TEST_CASE("Existing explicit settings survive load save and reopen", "[config]")
         CHECK(Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Off);
         CHECK_FALSE(Settings::values.async_presentation.GetValue());
         CHECK_FALSE(Settings::values.use_asynchronous_shaders.GetValue());
+        CHECK_FALSE(Settings::values.pin_gpu_threads.GetValue());
         CHECK(Settings::values.fsr_sharpening_slider.GetValue() == 83);
         CHECK(Settings::values.gpu_clock.GetValue() == Settings::GpuClock::Normal);
     }
 }
 
-TEST_CASE("Existing default markers and missing keys keep their historical values", "[config]") {
+TEST_CASE("Existing default markers and missing keys use the build's base defaults", "[config]") {
     ConfigDirectory directory;
     std::string contents;
     SECTION("Empty existing config") {}
@@ -232,7 +242,7 @@ TEST_CASE("Existing default markers and missing keys keep their historical value
     directory.Write("qt-config.ini", contents);
     for (int i = 0; i < 3; ++i) {
         FileConfig config{std::string{"qt-config"}};
-        CheckLegacyProfile();
+        CheckBaseProfile();
     }
 }
 
@@ -248,10 +258,10 @@ TEST_CASE("Resetting a seeded setting does not reapply the first-run profile", "
         Settings::values.use_asynchronous_shaders.LoadString("");
         config.SaveValues();
         config.Reload();
-        CheckLegacyProfile();
+        CheckBaseProfile();
     }
     FileConfig reopened{std::string{"qt-config"}};
-    CheckLegacyProfile();
+    CheckBaseProfile();
 }
 
 TEST_CASE("Per-game overrides and use-global flags survive the new global profile", "[config]") {
@@ -274,7 +284,7 @@ TEST_CASE("Per-game overrides and use-global flags survive the new global profil
         CHECK(Settings::values.scaling_filter.GetValue() == Settings::ScalingFilter::Bilinear);
         CHECK(Settings::values.scaling_filter.GetValue(true) == Settings::ScalingFilter::Fsr3);
         CHECK_FALSE(Settings::values.gpu_accuracy.UsingGlobal());
-        CHECK(Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
+        CHECK(Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
         CHECK(Settings::values.gpu_accuracy.GetValue(true) == Settings::GpuAccuracy::Low);
         CHECK(Settings::values.nvdec_emulation.UsingGlobal());
         CHECK(Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
@@ -304,7 +314,7 @@ TEST_CASE("A dangling config symlink is not a new user", "[config]") {
     std::filesystem::create_symlink(directory.path / "target.ini",
                                     directory.path / "qt-config.ini");
     FileConfig config{std::string{"qt-config"}};
-    CheckLegacyProfile();
+    CheckBaseProfile();
 }
 
 TEST_CASE("An unreadable config is not seeded or overwritten", "[config]") {
@@ -319,7 +329,7 @@ TEST_CASE("An unreadable config is not seeded or overwritten", "[config]") {
         SKIP("This user can read files despite restrictive permissions");
     }
     FileConfig config{std::string{"qt-config"}};
-    CheckLegacyProfile();
+    CheckBaseProfile();
     std::filesystem::permissions(filename, std::filesystem::perms::owner_read |
                                                std::filesystem::perms::owner_write);
     std::ifstream file{filename};
@@ -340,7 +350,7 @@ TEST_CASE("A denied config status lookup is not seeded", "[config]") {
         SKIP("This user can query paths despite restrictive permissions");
     }
     FileConfig config{std::make_optional(Common::FS::PathToUTF8String(filename))};
-    CheckLegacyProfile();
+    CheckBaseProfile();
     std::filesystem::permissions(inaccessible, std::filesystem::perms::owner_all);
     CHECK_FALSE(std::filesystem::exists(filename));
 }
@@ -351,5 +361,5 @@ TEST_CASE("A config path beneath a non-directory is not seeded", "[config]") {
     directory.Write("file", "not a directory");
     FileConfig config{
         std::make_optional(Common::FS::PathToUTF8String(directory.path / "file" / "config.ini"))};
-    CheckLegacyProfile();
+    CheckBaseProfile();
 }

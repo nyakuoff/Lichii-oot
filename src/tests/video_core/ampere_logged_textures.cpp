@@ -621,3 +621,85 @@ TEST_CASE("Half gathers reject reserved second coordinates before scratch copies
         }
     }
 }
+
+TEST_CASE("Half per-tap gathers preserve offsets across LEA.HI",
+          "[video_core][ampere][gather][logged_textures]") {
+    // Ocarina of Time 1080p upscaler (native program at 0x11491edc00), nvdisasm -b SM87:
+    // LEA.HI R8, R8, R7, RZ, 0x1f ; between the offset moves and
+    // TLD4.SCR.R.F16.RN.PTP R12, R10, R10, R0, 0x0, 0x30, 2D ;
+    const Instruction lea{{0x08087211, 0x00000007, 0x078ff8ff, 0x000fc800}};
+    const Instruction gather{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}};
+    auto code = std::array{
+        Instruction{{0x00007802, 0xff00ff00, 0xf00, 0}},
+        Instruction{{0x00017802, 0x01000001, 0xf00, 0}},
+        lea, gather, Exit,
+    };
+    const auto lowered = Shader::Ampere::LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    code[2].words[0] = 0x08017211;
+    // Our live-operand lowering also accepts the variant where LEA.HI changes the offsets.
+    CHECK(Shader::Ampere::LowerToMaxwell(code));
+}
+
+TEST_CASE("Per-tap gathers with runtime offsets gather each tap at its own offset",
+          "[video_core][ampere][gather][logged_textures]") {
+    // The guarded per-tap gather above, with its packed offsets read from a constant buffer
+    // instead of immediates: SPIR-V's ConstOffsets must be constant, so each tap is its own gather.
+    const std::array native{
+        Instruction{{0x000e7919, 0, 0x2100, 0}},
+        Instruction{{0x0e00720c, 0xff, 0x03f25070, 0}},
+        Instruction{{0xff107424U, 0xfffeffff, 0x078e00ff, 0}},
+        Instruction{{0xff117424U, 0xfffcfffd, 0x078e00ff, 0}},
+        Instruction{{0x06187b63U, 0x30007c10, 0x001e2f0eU, 0}},
+        Exit,
+    };
+    const auto lowered = Shader::Ampere::LowerToMaxwell(native);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    auto code = lowered.instructions;
+    // Our lowering keeps live offsets in the guest registers (R16/R17), not R248/R249.
+    const auto gather_start = code.begin() + lowered.source_instruction_offsets[4];
+    code.insert(gather_start, {0x4c98078001000010ULL, 0x4c98078001040011ULL});
+    for (const u32 reg : {14U, 24U})
+        code.insert(code.end() - 1, 0xef58000000070000ULL | reg | (255ULL << 8) |
+            (u64{reg * 4} << 20) | (4ULL << 48));
+    TextureEnvironment env;
+    env.code = code;
+    env.binding = lowered.required_texture_buffer;
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{0x50}};
+    Shader::ObjectPool<IR::Inst> inst_pool;
+    Shader::ObjectPool<IR::Block> block_pool;
+    Shader::HostTranslateInfo host;
+    host.ApplyDescriptorLimitPolicy();
+    auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+    u32 gathers = 0;
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : *block) {
+            if (inst.GetOpcode() != IR::Opcode::ImageGather) continue;
+            ++gathers;
+            REQUIRE_FALSE(inst.Arg(2).InstRecursive()->AreAllArgsImmediates());
+        }
+    }
+    REQUIRE(gathers == 1);
+    Shader::Profile profile{};
+    profile.supported_spirv = 0x00010400;
+    profile.support_image_gather_extended = true;
+    const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
+    REQUIRE(spirv.size() > 5);
+    constexpr u32 OpImageGather = 96;
+    constexpr u32 OffsetMask = 0x10, ConstOffsetsMask = 0x20;
+    u32 offset_gathers = 0;
+    for (size_t i = 5; i < spirv.size();) {
+        const u32 count = spirv[i] >> 16;
+        REQUIRE(count > 0);
+        if ((spirv[i] & 0xffff) == OpImageGather) {
+            REQUIRE(count > 6);
+            CHECK((spirv[i + 6] & ConstOffsetsMask) == 0);
+            if ((spirv[i + 6] & OffsetMask) != 0) ++offset_gathers;
+        }
+        i += count;
+    }
+    CHECK(offset_gathers == 4);
+}
