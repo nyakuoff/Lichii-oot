@@ -1002,7 +1002,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!disk_pipelines.insert(hash).second) {
             return;
         }
-        if (!PreloadAllPipelines() &&
+        // Switch 2 titles stutter on pipelines built mid-game, so all are built at boot (#708).
+        if (!PreloadAllPipelines() && !Settings::CurrentProgramIsSwitch2() &&
             (used_pipelines.empty()
                  ? queued_graphics >= MaxPipelinesWithoutUsedList
                  : !used_pipelines.contains(key.DriverNeutralHash()) &&
@@ -1228,7 +1229,8 @@ void PipelineCache::EvictUnusedPipelines() {
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
     constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // Native shaders are translated again when an evicted pipeline is needed (Eglantine #708).
+    if (frame_count <= EvictAfterFrames || Settings::CurrentProgramIsSwitch2()) {
         return;
     }
     // Only while the cache is large: each one evicted is translated again on the GPU thread when
