@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include "common/logging.h"
 #include "video_core/nx2_debug_control.h"
@@ -50,6 +51,17 @@ std::optional<double> QueryRefreshPeriodNs() {
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) &&
         mode.dmDisplayFrequency > 1) {
         return 1e9 / mode.dmDisplayFrequency;
+    }
+#else
+    // No compositor timing query here: the frontend reports the window's display, or the user.
+    static const double forced = [] {
+        const char* value = std::getenv("EDEN_NX2_HOST_REFRESH_HZ");
+        return value != nullptr ? std::atof(value) : 0.0;
+    }();
+    const double hz =
+        forced > 0.0 ? forced : VideoCommon::Nx2Perf::g_display_refresh_hz.load(std::memory_order_relaxed);
+    if (hz > 20.0 && hz < 1000.0) {
+        return 1e9 / hz;
     }
 #endif
     return std::nullopt;
