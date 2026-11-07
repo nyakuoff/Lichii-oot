@@ -253,6 +253,10 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
+    /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
+    /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
+    /// tonemapped image.
+    bool BypassOotNetwork(u64 program_id, u64 native_key);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
     /// Whether the dispatch being run is a pass of a game DLSS evaluation (Fortune's Weave).
     bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
@@ -281,6 +285,8 @@ private:
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
+    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
+    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();
     bool TryFireEmblemUpscale(bool allow_history = true);
     void CaptureFireEmblemJitter();

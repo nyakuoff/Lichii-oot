@@ -21,6 +21,12 @@
 
 namespace ConfigurationShared {
 
+/**
+ * Builds the label and tooltip every settings widget shows, keyed by setting id.
+ *
+ * @param parent Object used for translation lookups.
+ * @return The translation map.
+ */
 std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     std::unique_ptr<TranslationMap> translations = std::make_unique<TranslationMap>();
     const auto& tr = [](const char* text) -> QString { return QCoreApplication::translate("ConfigurationShared", text); };
@@ -159,12 +165,18 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
               "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
-              "download button below.\nCurrently requires Fire Emblem: Fortune's Weave and "
+              "download button below.\nFire Emblem: Fortune's Weave also needs "
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nTakes effect when a game starts."));
+              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
+              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
+    INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
+           tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
+              "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
+              "without the network (faster; pairs well with a higher resolution). Has no effect while "
+              "NVIDIA DLSS is on.\nTakes effect when the game starts."));
     INSERT(Settings, post_shader_chain, QString(), QString());
     INSERT(Settings, post_shader_preset, QString(), QString());
     INSERT(Settings, post_shader_enabled, tr("Enable post-processing effects"),
@@ -287,6 +299,17 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
+    INSERT(Settings, native_async_draws, tr("Switch 2 draws with unbuilt pipelines:"),
+           tr("Only applies when asynchronous shader building is on. Decides what a Switch 2 draw "
+              "does when its graphics pipeline is still building.\n"
+              "Wait stalls the GPU until the pipeline is ready (no missing effects, but long "
+              "stalls on new content). Skip drops the draw, which can leave an effect missing for "
+              "a few frames. Bounded waits up to the time below per frame, then skips. The "
+              "EDEN_NX2_ASYNC_DISCARD=1 environment variable still forces Skip."));
+    INSERT(Settings, native_pipeline_wait_ms, tr("Pipeline wait per frame (ms):"),
+           tr("Used by the Bounded mode: the most time per frame that Switch 2 draws may wait in "
+              "total for pipelines that are still building. Once spent, the remaining unbuilt "
+              "draws of that frame are skipped."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "
@@ -549,6 +572,11 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(AntiAliasing, Fxaa, tr("FXAA")),
                               PAIR(AntiAliasing, Smaa, tr("SMAA")),
                           }});
+    translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
+                          {
+                              PAIR(OotAntiAliasing, Game, tr("Game")),
+                              PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {
                               PAIR(AspectRatio, R16_9, tr("Default (16:9)")),
@@ -673,6 +701,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(ConsoleMode, Docked, tr("Docked")),
                               PAIR(ConsoleMode, Handheld, tr("Handheld")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::NativeAsyncDraws>::Index(),
+                          {
+                              PAIR(NativeAsyncDraws, Wait, tr("Wait")),
+                              PAIR(NativeAsyncDraws, Bounded, tr("Bounded wait")),
+                              PAIR(NativeAsyncDraws, Skip, tr("Skip")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::CpuClock>::Index(),
                           {
