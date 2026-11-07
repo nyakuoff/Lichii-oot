@@ -285,6 +285,34 @@ TEST_CASE("An existing versioned cache is never overwritten by a legacy one",
                                                       Magic, 39));
 }
 
+TEST_CASE("Graphics keys from another driver restamp to this one and share a neutral hash",
+          "[pipeline_cache_files][driver_restamp]") {
+    Vulkan::GraphicsPipelineCacheKey nvidia{};
+    nvidia.unique_hashes = {0xd9a82646337372bf, 0, 0, 0, 0, 0xf1a22fe67ecf7596};
+    nvidia.state.color_formats[0] = 0x2a;
+    nvidia.RestampDriver(4, 0x98960000);
+    auto radv = nvidia;
+    radv.RestampDriver(3, 0x06802005);
+
+    CHECK_FALSE(radv == nvidia);
+    CHECK(radv.Hash() != nvidia.Hash());
+    CHECK(radv.DriverNeutralHash() == nvidia.DriverNeutralHash());
+    CHECK(radv.DriverNeutralHash() != radv.Hash());
+
+    auto restamped = nvidia;
+    restamped.RestampDriver(3, 0x06802005);
+    CHECK(restamped == radv);
+    CHECK(restamped.Hash() == radv.Hash());
+
+    // Anything else in the key still tells pipelines apart.
+    auto other = radv;
+    other.state.color_formats[0] = 0x2b;
+    CHECK(other.DriverNeutralHash() != radv.DriverNeutralHash());
+    other = radv;
+    other.unique_hashes[5] ^= 1;
+    CHECK(other.DriverNeutralHash() != radv.DriverNeutralHash());
+}
+
 TEST_CASE("Cached compute failures retain their cause and the current dispatch address",
           "[pipeline_cache][diagnostics]") {
     const Vulkan::ComputePipelineCacheKey key{
@@ -320,4 +348,38 @@ TEST_CASE("Cached compute failures retain their cause and the current dispatch a
     CHECK(entry->second.failure.empty());
     CHECK(entry->second.Get(false, 0x2120633c00, other) == nullptr);
     REQUIRE_THROWS_AS(entry->second.Get(true, 0x2120633c00, other), Shader::RuntimeError);
+}
+
+TEST_CASE("Mesa updates restamp graphics keys without rewriting transferable caches",
+          "[pipeline_cache_files][driver_restamp]") {
+    TempDir temp;
+    const auto path = temp.path / "vulkan.fork-v53.bin";
+    Vulkan::GraphicsPipelineCacheKey recorded{};
+    recorded.unique_hashes[1] = 0x123456789abcdef0;
+    recorded.RestampDriver(3, 0x06802005);
+    SerializedEnvironment source{Shader::Stage::VertexB};
+    const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&source};
+    VideoCommon::SerializePipeline(recorded, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+    const auto before = ReadAll(path);
+    auto live = recorded;
+    live.RestampDriver(3, 0x06802006);
+    const std::unordered_map<u64, u8> used{{recorded.DriverNeutralHash(), 0}};
+    for (int boot = 0; boot < 2; ++boot) {
+        size_t loaded = 0;
+        VideoCommon::LoadPipelines(
+            {}, path, VideoCommon::VulkanPipelineCacheVersion,
+            [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+            [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment>) {
+                Vulkan::GraphicsPipelineCacheKey key;
+                file.read(reinterpret_cast<char*>(&key), sizeof(key));
+                REQUIRE(key == recorded);
+                key.RestampDriver(3, 0x06802006);
+                CHECK(key == live);
+                CHECK(key.Hash() == live.Hash());
+                CHECK(used.contains(key.DriverNeutralHash()));
+                ++loaded;
+            });
+        CHECK(loaded == 1);
+        CHECK(ReadAll(path) == before);
+    }
 }

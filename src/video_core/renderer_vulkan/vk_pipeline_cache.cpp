@@ -418,6 +418,12 @@ size_t GraphicsPipelineCacheKey::Hash() const noexcept {
     return static_cast<size_t>(hash);
 }
 
+u64 GraphicsPipelineCacheKey::DriverNeutralHash() const noexcept {
+    GraphicsPipelineCacheKey neutral = *this;
+    neutral.RestampDriver(0, 0);
+    return neutral.Hash();
+}
+
 bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) const noexcept {
     if (unique_hashes != rhs.unique_hashes) {
         return false;
@@ -698,7 +704,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
 
 namespace {
 // <title>/vulkan_used.bin: the graphics pipelines recent sessions used, as key hash + sessions
-// since the last use.
+// since the last use. Hashes are driver-neutral (DriverNeutralHash), so a list shipped with a cache
+// from another GPU still selects its pipelines; full key hashes from older lists still match.
 constexpr u32 UsedPipelinesMagic = 0x31505545; // "EUP1"
 // Pipelines the last two sessions used are built at boot. Each holds ~0.45 MB of driver memory:
 // title 1 built 4,800 from eight sessions, 1.5 GB more than building them on first use (but that
@@ -783,7 +790,7 @@ void PipelineCache::SaveUsedPipelines() {
     next.reserve(used_pipelines.size() + used_this_session.size());
     for (const auto& [key, pipeline] : graphics_cache) {
         if (used_this_session.contains(pipeline.get())) {
-            next.emplace(key.Hash(), u8{0});
+            next.emplace(key.DriverNeutralHash(), u8{0});
         }
     }
     for (const u64 hash : used_and_evicted) {
@@ -894,6 +901,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     size_t skipped_pipelines = 0;
     size_t deferred_pipelines = 0;
     size_t queued_graphics = 0;
+    size_t restamped_pipelines = 0;
+    size_t feature_mismatches = 0;
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -938,6 +947,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
 
+        const u64 recorded_hash = key.Hash();
+
         if (!device.IsExtMeshShaderSupported() &&
             std::ranges::any_of(envs, [](const FileEnvironment& env) {
                 return env.ShaderStage() == Shader::Stage::Task ||
@@ -960,18 +971,31 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 dynamic_features.has_color_write_enable ||
             (key.state.dynamic_vertex_input != 0) !=
                 dynamic_features.has_dynamic_vertex_input) {
+            // State a dynamic feature covers is not in the key, so it cannot be converted.
+            ++feature_mismatches;
             return;
         }
 
         const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
         if (key_requests_provoking_last && !dynamic_features.has_provoking_vertex_last_mode) {
+            ++feature_mismatches;
             return;
         }
 
         const bool key_uses_transform_feedback = key.state.xfb_enabled != 0;
         if (key_uses_transform_feedback && key_requests_provoking_last &&
             !dynamic_features.has_provoking_vertex_tf_preserve) {
+            ++feature_mismatches;
             return;
+        }
+
+        // Pipelines recorded with another driver (another GPU, or this one before an update) are
+        // built from guest data for this driver like any other, but their key would never match
+        // a draw here. Restamp them so a cache from any GPU with these features is usable.
+        if (key.state.driver_id != dynamic_features.driver_id ||
+            key.state.driver_version != dynamic_features.driver_version) {
+            key.RestampDriver(dynamic_features.driver_id, dynamic_features.driver_version);
+            ++restamped_pipelines;
         }
 
         const u64 hash = key.Hash();
@@ -979,8 +1003,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
         if (!PreloadAllPipelines() &&
-            (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
-                                    : !used_pipelines.contains(hash))) {
+            (used_pipelines.empty()
+                 ? queued_graphics >= MaxPipelinesWithoutUsedList
+                 : !used_pipelines.contains(key.DriverNeutralHash()) &&
+                       !used_pipelines.contains(hash) && !used_pipelines.contains(recorded_hash))) {
             ++skipped_pipelines;
             size_t capture_bytes = (envs.capacity() - envs.size()) * sizeof(FileEnvironment);
             for (const auto& env : envs) {
@@ -1032,6 +1058,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                load_graphics);
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (restamped_pipelines != 0 || feature_mismatches != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "{} cached graphics pipelines from another driver restamped for this one; {} "
+                 "dropped, recorded with dynamic-state features this device does not match",
+                 restamped_pipelines, feature_mismatches);
+    }
     if (skipped_pipelines != 0) {
         LOG_INFO(
             Render_Vulkan,
@@ -1222,7 +1254,7 @@ void PipelineCache::EvictUnusedPipelines() {
             continue;
         }
         if (used_this_session.erase(pipeline) != 0) {
-            used_and_evicted.insert(it->first.Hash());
+            used_and_evicted.insert(it->first.DriverNeutralHash());
         }
         evicted_pipelines.emplace_back(tick, std::move(it->second));
         it = graphics_cache.erase(it);

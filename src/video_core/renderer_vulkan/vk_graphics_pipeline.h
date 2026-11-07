@@ -41,6 +41,16 @@ struct GraphicsPipelineCacheKey {
 
     size_t Hash() const noexcept;
 
+    /// Hash with the driver id and version cleared, so a pipeline matches across drivers.
+    u64 DriverNeutralHash() const noexcept;
+
+    /// Stamps the key with another driver. The driver fields never change the built pipeline;
+    /// they only keep keys of different drivers apart.
+    void RestampDriver(u32 driver_id, u32 driver_version) noexcept {
+        state.driver_id = driver_id;
+        state.driver_version = driver_version;
+    }
+
     bool operator==(const GraphicsPipelineCacheKey& rhs) const noexcept;
 
     bool operator!=(const GraphicsPipelineCacheKey& rhs) const noexcept {
