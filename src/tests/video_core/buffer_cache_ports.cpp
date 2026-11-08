@@ -558,7 +558,7 @@ TEST_CASE("Native uniform banks upload directly without overwriting GPU-owned by
     std::memset(f.bytes + 0x10000, 0x5a, 0x10000);
     Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
     REQUIRE(f.runtime.upload_bytes == 0x10000);
-    REQUIRE(Access::CpuMarks(*f.cache) == 0);
+    REQUIRE(Access::CpuMarks(*f.cache) == 16);
     REQUIRE(Access::Get(*f.cache, id).bytes[0xffff] == 0x5a);
     Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
     REQUIRE(f.runtime.uploads == 1);
@@ -570,7 +570,7 @@ TEST_CASE("Native uniform banks upload directly without overwriting GPU-owned by
     REQUIRE(Access::Get(*f.cache, id).bytes[0x1000] == 0x5a);
 }
 
-TEST_CASE("Native uniform uploads stop at holes and keep unaligned bank boundaries",
+TEST_CASE("Native uniform uploads stop at holes and copy whole pages at unaligned starts",
           "[buffer_ports]") {
     Fixture f;
     f.memory->EnableNativeTiling();
@@ -585,20 +585,22 @@ TEST_CASE("Native uniform uploads stop at holes and keep unaligned bank boundari
     std::memset(f.bytes + 0x10000, 0x6b, 0x20000);
     f.device.Unmap(0x22000, 0x1000);
     Access::Uniform(*f.cache, channel, id, 0x20123, 0x10000);
-    REQUIRE(f.runtime.upload_bytes == 0x1edd);
+    // The bank is compared and copied page by page, so the page holding the start goes whole
+    // and the hole stops the upload there.
+    REQUIRE(f.runtime.upload_bytes == 0x2000);
+    REQUIRE(Access::CpuMarks(*f.cache) == 2);
     const auto& data = Access::Get(*f.cache, id).bytes;
-    REQUIRE(data[0x122] == 0);
+    REQUIRE(data[0x122] == 0x6b);
     REQUIRE(data[0x123] == 0x6b);
     REQUIRE(data[0x1fff] == 0x6b);
     REQUIRE(data[0x2000] == 0);
     REQUIRE(data[0x3000] == 0);
-    REQUIRE(Access::CpuMarks(*f.cache) == 0);
     f.device.Map(0x22000, 0x22000, 0x1000, f.asid);
     Access::NextFrame(*f.cache);
     Access::Uniform(*f.cache, channel, id, 0x20123, 0x10000);
-    REQUIRE(f.runtime.upload_bytes == 0x11edd);
+    REQUIRE(f.runtime.upload_bytes == 0x11000);
     REQUIRE(data[0x10122] == 0x6b);
-    REQUIRE(data[0x10123] == 0);
+    REQUIRE(data[0x10123] == 0x6b);
 }
 
 TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_ports]") {
