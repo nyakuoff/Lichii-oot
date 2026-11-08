@@ -14,6 +14,7 @@
 #include <future>
 #include <iterator>
 #include <numeric>
+#include <mutex>
 #include <thread>
 
 #include "common/fs/path_util.h"
@@ -33,6 +34,7 @@
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_base.h"
 
 namespace Core::Nx2Debug {
@@ -47,6 +49,8 @@ constexpr u64 MAX_READ = 64 * 1024;
 /// Presented frames one input or input_sequence call holds at most (10 minutes at 60 fps).
 constexpr u64 MAX_INPUT_FRAMES = 36000;
 constexpr size_t MAX_INPUT_STEPS = 1000;
+/// Presented frames one input recording or input_replay holds at most (4 hours at 60 fps).
+constexpr u64 MAX_RECORD_FRAMES = 864000;
 
 constexpr std::array<std::pair<std::string_view, HID::NpadButton>, 16> INPUT_BUTTONS{{
     {"A", HID::NpadButton::A},         {"B", HID::NpadButton::B},
@@ -58,6 +62,24 @@ constexpr std::array<std::pair<std::string_view, HID::NpadButton>, 16> INPUT_BUT
     {"Left", HID::NpadButton::Left},   {"Right", HID::NpadButton::Right},
     {"StickL", HID::NpadButton::StickL}, {"StickR", HID::NpadButton::StickR},
 }};
+
+/// input_record's sampler: one sample per present, run-length encoded as it goes.
+struct InputRecorder {
+    std::mutex mutex;
+    HID::EmulatedController* controller{};
+    std::string controller_name;
+    u64 first_present{};
+    u64 last_present{};
+    u64 frames{};
+    u64 missed{};
+    bool full{};
+    /// A stopped recording whose file could not be written yet; stop retries it.
+    bool unsaved{};
+    HID::InjectedInput last{};
+    std::vector<InputStep> steps;
+    /// Last, so it is joined before the members it reads go.
+    std::jthread thread;
+};
 
 struct ToolState {
     explicit ToolState(System& system_, std::string title_, u64 program_id_,
@@ -79,6 +101,7 @@ struct ToolState {
     u64 screenshots{};
     u64 samples{};
     u64 gpu_reads{};
+    InputRecorder recorder;
     std::atomic<bool> stopping{};
 };
 
@@ -190,7 +213,13 @@ json Status(ToolState& state, const json& params) {
     const u64 after = g_nx2_present_count.load(std::memory_order_relaxed);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    json frame_times = json::array();
+    for (const auto& count : VideoCommon::Nx2Perf::g_frame_times) {
+        frame_times.push_back(count.load(std::memory_order_relaxed));
+    }
     return {
+        {"frame_time_bucket_us", VideoCommon::Nx2Perf::FrameTimeBucketNs / 1000},
+        {"frame_times", std::move(frame_times)},
         {"title", state.title},
         {"program_id", fmt::format("{:016X}", state.program_id)},
         {"build", std::string{Common::g_build_fullname}},
@@ -527,6 +556,29 @@ json SampleThreads(ToolState& state, const json& params) {
     return {{"file", path.generic_string()}, {"report", std::move(report)}};
 }
 
+json SetSwitch(ToolState&, const json& params) {
+    const std::string name = params.at("name").get<std::string>();
+    auto* const value = VideoCore::Nx2Debug::FindSwitch(name);
+    if (value == nullptr) {
+        throw std::runtime_error{fmt::format("unknown live switch {}", name)};
+    }
+    const int previous = value->load(std::memory_order_relaxed);
+    if (params.contains("value")) {
+        value->store(params.at("value").get<int>(), std::memory_order_relaxed);
+    }
+    return {{"name", name}, {"previous", previous}, {"value", value->load()}};
+}
+
+// Lifts or restores the speed limit (test scripts boot through the logos and menus unlimited).
+json SpeedLimit(ToolState&, const json& params) {
+    auto& setting = Settings::values.use_speed_limit;
+    const bool previous = setting.GetValue();
+    if (params.contains("on")) {
+        setting.SetValue(params.at("on").get<bool>());
+    }
+    return {{"previous", previous}, {"on", setting.GetValue()}};
+}
+
 json ReadMemory(ToolState& state, const json& params) {
     const u64 address = AddressParam(params, "address");
     const u64 size = ReadSize(params, address);
@@ -618,34 +670,88 @@ json ReadGpuMemory(ToolState& state, const json& params) {
     return result;
 }
 
-/// Holds the steps on player 1 (or the handheld controller when player 1 is not connected) from
-/// the next present on, and returns once they are done. The injector stops by itself after the
-/// last step; leaving this function by any path removes it.
+/// "player1" or "handheld"; empty picks player 1, or the handheld controller when player 1 is
+/// not connected.
+std::pair<HID::EmulatedController*, std::string> PickController(ToolState& state,
+                                                                std::string_view wanted) {
+    auto& hid = state.system.HIDCore();
+    if (wanted.empty()) {
+        HID::EmulatedController* const player1 = hid.GetEmulatedController(HID::NpadIdType::Player1);
+        if (player1->IsConnected()) {
+            return {player1, "player1"};
+        }
+        HID::EmulatedController* const handheld =
+            hid.GetEmulatedController(HID::NpadIdType::Handheld);
+        if (handheld->IsConnected()) {
+            return {handheld, "handheld"};
+        }
+        throw std::runtime_error{"neither player 1 nor the handheld controller is connected"};
+    }
+    if (wanted != "player1" && wanted != "handheld") {
+        throw std::runtime_error{fmt::format("controller \"{}\": want player1 or handheld", wanted)};
+    }
+    HID::EmulatedController* const controller = hid.GetEmulatedController(
+        wanted == "player1" ? HID::NpadIdType::Player1 : HID::NpadIdType::Handheld);
+    if (!controller->IsConnected()) {
+        throw std::runtime_error{fmt::format("the {} controller is not connected", wanted)};
+    }
+    return {controller, std::string{wanted}};
+}
+
+struct InputRun {
+    u64 max_frames = MAX_INPUT_FRAMES;
+    int max_timeout_s = 900;
+    std::string_view controller;
+    /// The present count the first step starts at; the next present when unset.
+    std::optional<u64> at_present;
+    /// Above 0: steps advance with elapsed time at this many frames a second instead of with
+    /// presents. Games that move by elapsed time (Ocarina of Time) then follow the recorded path
+    /// whatever frame rate the replay runs at.
+    double frame_rate = 0.0;
+};
+
+/// Holds the steps on the run's controller from the next present (or at_present) on, and returns
+/// once they are done. The injector stops by itself after the last step; leaving this function by
+/// any path removes it.
 json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json& params,
-              const ClientGone& client_gone) {
+              const ClientGone& client_gone, const InputRun& run = {}) {
     u64 total = 0;
     for (const InputStep& step : steps) {
         total += step.frames;
     }
-    if (total > MAX_INPUT_FRAMES) {
+    if (total > run.max_frames) {
         throw std::runtime_error{
-            fmt::format("{} frames in total; at most {} per call", total, MAX_INPUT_FRAMES)};
+            fmt::format("{} frames in total; at most {} per call", total, run.max_frames)};
     }
-    auto& hid = state.system.HIDCore();
-    HID::EmulatedController* controller = hid.GetEmulatedController(HID::NpadIdType::Player1);
-    std::string name = "player1";
-    if (!controller->IsConnected()) {
-        controller = hid.GetEmulatedController(HID::NpadIdType::Handheld);
-        name = "handheld";
+    const auto picked = PickController(state, run.controller);
+    HID::EmulatedController* const controller = picked.first;
+    const std::string& name = picked.second;
+    const u64 current = g_nx2_present_count.load(std::memory_order_relaxed);
+    const u64 start = run.at_present.value_or(current + 1);
+    if (start <= current) {
+        throw std::runtime_error{
+            fmt::format("at_present {} has already been presented (now {})", start, current)};
     }
-    if (!controller->IsConnected()) {
-        throw std::runtime_error{"neither player 1 nor the handheld controller is connected"};
-    }
-    const int timeout = Param<int>(params, "timeout_s", static_cast<int>(total / 20 + 10), 1, 900);
-    const u64 start = g_nx2_present_count.load(std::memory_order_relaxed) + 1;
+    const u64 wait_frames = start - current - 1 + total;
+    const int timeout = Param<int>(
+        params, "timeout_s",
+        static_cast<int>((std::min)(wait_frames / 20 + 10, static_cast<u64>(run.max_timeout_s))), 1,
+        run.max_timeout_s);
     const auto script = std::make_shared<const std::vector<InputStep>>(steps);
-    controller->SetInputInjector([script, start] {
-        return InputAt(*script, start, g_nx2_present_count.load(std::memory_order_relaxed));
+    const auto ends = std::make_shared<const std::vector<u64>>(InputStepEnds(steps, start));
+    const double frame_rate = run.frame_rate;
+    const auto timed_from = std::chrono::steady_clock::now();
+    // The frame the replay is at: the present count, or with frame_rate the elapsed time.
+    const auto frame_now = [frame_rate, timed_from, start] {
+        if (frame_rate > 0.0) {
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - timed_from).count();
+            return start + static_cast<u64>(seconds * frame_rate);
+        }
+        return g_nx2_present_count.load(std::memory_order_relaxed);
+    };
+    controller->SetInputInjector([script, ends, frame_now] {
+        return InputAt(*script, *ends, frame_now());
     });
     SCOPE_EXIT {
         controller->SetInputInjector({});
@@ -653,7 +759,7 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
     const auto begin = std::chrono::steady_clock::now();
     const auto deadline = begin + std::chrono::seconds{timeout};
     for (;;) {
-        const u64 now = g_nx2_present_count.load(std::memory_order_relaxed);
+        const u64 now = frame_now();
         if (now >= start + total) {
             break;
         }
@@ -676,6 +782,7 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
         {"steps", steps.size()},
         {"frames", total},
         {"first_present", start},
+        {"frame_rate", frame_rate},
         {"elapsed_s",
          std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count()},
     };
@@ -703,6 +810,192 @@ json InputSequence(ToolState& state, const json& params, const ClientGone& clien
     return RunInput(state, steps, params, client_gone);
 }
 
+/// A UTF-8 path; relative ones are under the dump directory.
+std::filesystem::path InputPath(const ToolState& state, const std::string& text) {
+    const std::filesystem::path path{Common::FS::ToU8String(text)};
+    return path.is_absolute() ? path : state.dump_directory / path;
+}
+
+void SampleInput(std::stop_token stop, InputRecorder& recorder) {
+    while (!stop.stop_requested()) {
+        std::this_thread::sleep_for(500us);
+        const u64 now = g_nx2_present_count.load(std::memory_order_relaxed);
+        std::scoped_lock lock{recorder.mutex};
+        if (now == recorder.last_present || recorder.full) {
+            continue;
+        }
+        if (now < recorder.last_present) {
+            // The count restarted with a new boot; nothing was presented for this recording.
+            recorder.last_present = now;
+            continue;
+        }
+        const HID::InjectedInput input = RecordedInput(recorder.controller->GetNpadButtons().raw,
+                                                       recorder.controller->GetSticks());
+        const u64 skipped = now - recorder.last_present - 1;
+        if (skipped > 0) {
+            AppendRecordedInput(recorder.steps, recorder.frames > 0 ? recorder.last : input,
+                                skipped);
+            recorder.missed += skipped;
+            recorder.frames += skipped;
+        }
+        AppendRecordedInput(recorder.steps, input, 1);
+        ++recorder.frames;
+        recorder.last = input;
+        recorder.last_present = now;
+        if (recorder.frames >= MAX_RECORD_FRAMES) {
+            recorder.full = true;
+            LOG_WARNING(Debug, "Input recording reached {} frames; sampling stopped",
+                        MAX_RECORD_FRAMES);
+        }
+    }
+}
+
+json RecordingStatus(const InputRecorder& recorder) {
+    return {
+        {"recording", recorder.thread.joinable()},
+        {"unsaved", recorder.unsaved},
+        {"controller", recorder.controller_name},
+        {"first_present", recorder.first_present},
+        {"frames", recorder.frames},
+        {"steps", recorder.steps.size()},
+        {"missed", recorder.missed},
+        {"full", recorder.full},
+    };
+}
+
+json InputRecord(ToolState& state, const json& params) {
+    InputRecorder& recorder = state.recorder;
+    const std::string action = params.at("action").get<std::string>();
+    if (action == "status") {
+        std::scoped_lock lock{recorder.mutex};
+        return RecordingStatus(recorder);
+    }
+    if (action == "start") {
+        if (recorder.thread.joinable()) {
+            throw std::runtime_error{"a recording is already running; stop it first"};
+        }
+        const auto [controller, name] =
+            PickController(state, params.value("controller", std::string{}));
+        if (controller->HasInputInjector()) {
+            throw std::runtime_error{
+                fmt::format("debug server input is being injected into {}; record after it", name)};
+        }
+        std::scoped_lock lock{recorder.mutex};
+        recorder.controller = controller;
+        recorder.controller_name = name;
+        recorder.last_present = g_nx2_present_count.load(std::memory_order_relaxed);
+        recorder.first_present = recorder.last_present + 1;
+        recorder.frames = 0;
+        recorder.missed = 0;
+        recorder.full = false;
+        recorder.unsaved = false;
+        recorder.last = {};
+        recorder.steps.clear();
+        recorder.thread =
+            std::jthread{[&recorder](std::stop_token stop) { SampleInput(stop, recorder); }};
+        LOG_INFO(Debug, "Input recording of {} started at present {}", name,
+                 recorder.first_present);
+        return RecordingStatus(recorder);
+    }
+    if (action != "stop") {
+        throw std::runtime_error{fmt::format("action \"{}\": want start, stop or status", action)};
+    }
+    if (recorder.thread.joinable()) {
+        recorder.thread.request_stop();
+        recorder.thread.join();
+        recorder.unsaved = true;
+    } else if (!recorder.unsaved) {
+        throw std::runtime_error{"no recording is running"};
+    }
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const std::filesystem::path path =
+        params.contains("path") ? InputPath(state, params.at("path").get<std::string>())
+                                : state.dump_directory / fmt::format("input_{}.json", stamp);
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::string text = fmt::format("{{\"version\":1,\"controller\":\"{}\",\"first_present\":{},"
+                                   "\"frames\":{},\"missed\":{},\"steps\":[",
+                                   recorder.controller_name, recorder.first_present,
+                                   recorder.frames, recorder.missed);
+    for (size_t index = 0; index < recorder.steps.size(); ++index) {
+        text += index == 0 ? "\n" : ",\n";
+        text += InputStepJson(recorder.steps[index]).dump();
+    }
+    text += "\n]}\n";
+    {
+        std::ofstream file{path, std::ios::binary | std::ios::trunc};
+        file.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!file) {
+            throw std::runtime_error{fmt::format(
+                "cannot write {}; the recording is kept, stop again with another path",
+                Common::FS::PathToUTF8String(path))};
+        }
+    }
+    recorder.unsaved = false;
+    const std::string written = Common::FS::PathToUTF8String(path);
+    LOG_INFO(Debug, "Input recording of {} frames ({} missed) written to {}", recorder.frames,
+             recorder.missed, written);
+    json result = RecordingStatus(recorder);
+    result["path"] = written;
+    return result;
+}
+
+/// Plays a recording's steps in one run, so recordings beyond input_sequence's limits play
+/// without gaps between chunks.
+json InputReplay(ToolState& state, const json& params, const ClientGone& client_gone) {
+    const std::filesystem::path path = InputPath(state, params.at("path").get<std::string>());
+    std::ifstream file{path, std::ios::binary};
+    if (!file) {
+        throw std::runtime_error{fmt::format("cannot read {}", Common::FS::PathToUTF8String(path))};
+    }
+    const json recording = json::parse(file);
+    if (recording.value("version", 1) != 1) {
+        throw std::runtime_error{"unknown recording version; want 1"};
+    }
+    const json& list = recording.at("steps");
+    if (!list.is_array() || list.empty()) {
+        throw std::runtime_error{"steps must be a non-empty array"};
+    }
+    std::vector<InputStep> steps;
+    steps.reserve(list.size());
+    for (size_t index = 0; index < list.size(); ++index) {
+        try {
+            steps.push_back(ParseInputStep(list[index]));
+        } catch (const std::exception& error) {
+            throw std::runtime_error{fmt::format("step {}: {}", index, error.what())};
+        }
+    }
+    const std::string controller =
+        params.value("controller", recording.value("controller", std::string{}));
+    std::optional<u64> at_present;
+    if (params.contains("at_present")) {
+        at_present = params.at("at_present").get<u64>();
+    }
+    // Timing: "time" (default when the recording has its rate) replays by elapsed time at the
+    // recorded frame rate; "frames" replays one step frame per present.
+    double frame_rate = 0.0;
+    if (params.value("timing", std::string{"time"}) == "time") {
+        if (params.contains("frame_rate")) {
+            frame_rate = params.at("frame_rate").get<double>();
+        } else if (recording.contains("frame_rate")) {
+            frame_rate = recording.at("frame_rate").get<double>();
+        } else if (recording.contains("seconds") && recording.value("seconds", 0.0) > 0.0) {
+            frame_rate = recording.value("frames", 0.0) / recording.at("seconds").get<double>();
+        }
+    }
+    json result = RunInput(state, steps, params, client_gone,
+                           {.max_frames = MAX_RECORD_FRAMES,
+                            .max_timeout_s = 86400,
+                            .controller = controller,
+                            .at_present = at_present,
+                            .frame_rate = frame_rate});
+    result["path"] = Common::FS::PathToUTF8String(path);
+    return result;
+}
+
 Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
     const auto handler = [&state](json (*tool)(ToolState&, const json&)) -> Handler {
         return [state, tool](const json& params, const ClientGone&) { return tool(*state, params); };
@@ -723,11 +1016,15 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"sample", handler(SampleThreads)},
         {"timeline", handler(Timeline)},
         {"pgo_dump", handler(PgoDump)},
+        {"switch", handler(SetSwitch)},
+        {"speed_limit", handler(SpeedLimit)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},
         {"input", waiting(Input)},
         {"input_sequence", waiting(InputSequence)},
+        {"input_record", handler(InputRecord)},
+        {"input_replay", waiting(InputReplay)},
     };
 }
 
@@ -944,6 +1241,104 @@ std::optional<HID::InjectedInput> InputAt(std::span<const InputStep> steps, u64 
         }
     }
     return std::nullopt;
+}
+
+std::vector<u64> InputStepEnds(std::span<const InputStep> steps, u64 start) {
+    std::vector<u64> ends;
+    ends.reserve(steps.size());
+    u64 end = start;
+    for (const InputStep& step : steps) {
+        end += step.frames;
+        ends.push_back(end);
+    }
+    return ends;
+}
+
+std::optional<HID::InjectedInput> InputAt(std::span<const InputStep> steps,
+                                          std::span<const u64> ends, u64 now) {
+    if (steps.empty() || now < ends.front() - steps.front().frames) {
+        return std::nullopt;
+    }
+    const auto it = std::ranges::upper_bound(ends, now);
+    if (it == ends.end()) {
+        return std::nullopt;
+    }
+    return steps[static_cast<size_t>(it - ends.begin())].input;
+}
+
+namespace {
+
+constexpr double RECORD_STICK_STEPS = 1024.0;
+constexpr double RECORD_STICK_DEADZONE = 0.02;
+
+double QuantizedAxis(s32 raw) {
+    const double value =
+        std::clamp(static_cast<double>(raw) / HID::HID_JOYSTICK_MAX, -1.0, 1.0);
+    if (std::abs(value) < RECORD_STICK_DEADZONE) {
+        return 0.0;
+    }
+    return std::round(value * RECORD_STICK_STEPS) / RECORD_STICK_STEPS;
+}
+
+HID::AnalogStickState QuantizedStick(const HID::AnalogStickState& stick) {
+    // The same scaling ParseInputStep applies, so a written and re-read step compares equal.
+    const auto axis = [](s32 raw) {
+        return static_cast<s32>(std::lround(QuantizedAxis(raw) * HID::HID_JOYSTICK_MAX));
+    };
+    return {.x = axis(stick.x), .y = axis(stick.y)};
+}
+
+bool SameStick(const std::optional<HID::AnalogStickState>& a,
+               const std::optional<HID::AnalogStickState>& b) {
+    return a.has_value() == b.has_value() && (!a || (a->x == b->x && a->y == b->y));
+}
+
+bool SameInput(const HID::InjectedInput& a, const HID::InjectedInput& b) {
+    return a.buttons == b.buttons && SameStick(a.left, b.left) && SameStick(a.right, b.right);
+}
+
+} // Anonymous namespace
+
+HID::InjectedInput RecordedInput(HID::NpadButton buttons, const HID::AnalogSticks& sticks) {
+    HID::NpadButton kept = HID::NpadButton::None;
+    for (const auto& [_, button] : INPUT_BUTTONS) {
+        kept |= buttons & button;
+    }
+    return {.buttons = kept, .left = QuantizedStick(sticks.left), .right = QuantizedStick(sticks.right)};
+}
+
+void AppendRecordedInput(std::vector<InputStep>& steps, const HID::InjectedInput& input,
+                         u64 frames) {
+    while (frames > 0) {
+        if (steps.empty() || !SameInput(steps.back().input, input) ||
+            steps.back().frames >= MAX_INPUT_FRAMES) {
+            steps.push_back({.input = input, .frames = 0});
+        }
+        const u64 added = (std::min)(frames, MAX_INPUT_FRAMES - steps.back().frames);
+        steps.back().frames += added;
+        frames -= added;
+    }
+}
+
+json InputStepJson(const InputStep& step) {
+    json result = {{"frames", step.frames}};
+    json buttons = json::array();
+    for (const auto& [name, button] : INPUT_BUTTONS) {
+        if ((step.input.buttons & button) != HID::NpadButton::None) {
+            buttons.push_back(std::string{name});
+        }
+    }
+    if (!buttons.empty()) {
+        result["buttons"] = std::move(buttons);
+    }
+    const auto stick = [&result](const char* key, const std::optional<HID::AnalogStickState>& value) {
+        if (value) {
+            result[key] = {QuantizedAxis(value->x), QuantizedAxis(value->y)};
+        }
+    };
+    stick("left_stick", step.input.left);
+    stick("right_stick", step.input.right);
+    return result;
 }
 
 Service::Service(System& system, std::string title, u64 program_id, const Endpoint& endpoint,

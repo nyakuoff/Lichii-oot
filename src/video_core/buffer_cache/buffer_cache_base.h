@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -33,6 +34,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
@@ -156,6 +158,10 @@ public:
     std::array<u64, NUM_STAGES> written_storage_buffers{};
     u64 enabled_compute_storage_buffers = 0;
     u64 written_compute_storage_buffers = 0;
+    // Bound by a native (Switch 2) compute program, whose pointers carry no size.
+    u64 native_compute_storage_buffers = 0;
+    // Bytes from each compute storage binding's start that a dispatch marks GPU-written.
+    std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_write_marks{};
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -238,7 +244,8 @@ public:
     void TickFrame();
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
-                               std::span<const MultiRangeSegment> pool);
+                               std::span<const MultiRangeSegment> pool,
+                               u64 write_mark_limit = ~u64{0});
 
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);
@@ -308,8 +315,10 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written, u32 indirect_offset = ~0U);
+                                  bool is_written, u32 indirect_offset = ~0U,
+                                  const Shader::StorageWriteExtent& write_extent = {});
 
     void UnbindComputeTextureBuffers();
 
@@ -463,8 +472,57 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
-    /// Indirectly read banks of native programs already uploaded this frame.
-    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// The guest words of each page of native programs' indirectly read banks when last checked:
+    /// unchanged pages keep their tracking (marking them CPU-modified costs two mprotect calls
+    /// per page).
+    struct NativeBankPage {
+        std::array<u8, Core::DEVICE_PAGESIZE> words;
+        /// EDEN_NX2_EXP4 & 2: the bytes of the page compared during draw `checked_draw`.
+        u64 checked_draw = 0;
+        u32 checked_begin = 0;
+        u32 checked_end = 0;
+        /// EDEN_NX2_EXP9: frame_tick of the page's last compare, and whether the next bind
+        /// compares it again (a flagged write's bytes may land after the compare that took it).
+        u64 checked_frame = ~u64{0};
+        /// frame_tick when the page was last seen changed: such pages are compared on every bind.
+        u64 changed_frame = ~u64{0};
+        bool recheck = false;
+    };
+    std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
+    /// Counts graphics draws (UpdateGraphicsBuffers) for EDEN_NX2_EXP4 & 2.
+    u64 native_bank_draw = 0;
+    /// EDEN_NX2_EXP4 != 0: bank check cost, logged every 5 s.
+    struct NativeBankCheckStats {
+        u64 binds = 0;
+        u64 bytes_compared = 0;
+        u64 bytes_trimmed = 0;
+        u64 pages_compared = 0;
+        u64 pages_skipped = 0;
+        u64 pages_changed = 0;
+        std::chrono::steady_clock::time_point last_log{};
+    } native_bank_stats;
+    /// EDEN_NX2_EXP9 != 0: why bank pages were compared and which of them had changed, by the
+    /// first reason that applies (NativeBankReason), logged every 5 s.
+    /// EDEN_NX2_EXP9: a page that changed within this many frames is compared on every bind.
+    static constexpr u64 HotFrames = 120;
+    enum NativeBankReason : size_t {
+        BankCollected, ///< Collected CPU writes (Core::g_collected_write_pages)
+        BankWritten,   ///< Writes the buffer cache saw (Core::g_buffer_write_pages)
+        BankRecheck,   ///< Flagged at the previous bind
+        BankCpuDirty,  ///< CPU-modified in the tracker
+        BankHot,       ///< Changed within the last HotFrames frames (per-draw data)
+        BankFrame,     ///< Not compared yet this frame
+        BankNone,      ///< No reason: EXP9=2 compares these only to verify
+        BankReasons,
+    };
+    struct NativeBankTrackedStats {
+        u64 binds = 0;
+        u64 pages_new = 0;
+        u64 pages_skipped = 0;
+        std::array<u64, BankReasons> compared{};
+        std::array<u64, BankReasons> changed{};
+        std::chrono::steady_clock::time_point last_log{};
+    } native_bank_tracked_stats;
 
 private:
     template <typename Mask, typename Func>
@@ -510,6 +568,9 @@ private:
     void BindHostGraphicsUniformBuffers(size_t stage);
 
     void BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind);
+
+    /// EDEN_NX2_EXP9: the native uniform bank check of a bind of [device_addr, device_addr + size).
+    void CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode);
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 
@@ -767,6 +828,47 @@ private:
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;
+
+    /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings
+    /// and the set of buffers stay the same. Bumped whenever a buffer is created, joined or
+    /// deleted (ChangeRegister) and when the inline index buffer is replaced.
+    u64 binding_epoch = 1;
+
+    /// The last BindGraphicsUniformBuffer of a (stage, slot) and what it translated to, valid
+    /// while that binding is the one it set (EXP18 & 1).
+    struct UniformBindMemo {
+        u64 epoch{}; ///< binding_epoch when stored; 0 never matches
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        GPUVAddr gpu_addr{};
+        DAddr device_addr{};
+        u32 size{};
+    };
+    std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_bind_memo{};
+
+    /// One storage binding's last lookup when it resolved to a single buffer (no segments)
+    /// (EXP18 & 2). Index NUM_STAGES is compute.
+    struct StorageBindingMemo {
+        u64 epoch{}; ///< binding_epoch when stored; 0 never matches
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        DAddr device_addr{};
+        GPUVAddr gpu_addr{};
+        u32 size{};
+        bool is_written{};
+        BufferId buffer_id{};
+    };
+    std::array<std::array<StorageBindingMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES + 1>
+        storage_binding_memo{};
+
+    /// FindBuffer and ResolveMultiRangeStorage for one storage binding, from its memo when
+    /// nothing they depend on changed.
+    void ResolveStorageBinding(size_t memo_stage, u32 index, Binding& binding, bool is_written,
+                               std::vector<MultiRangeSegment>& pool);
+
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;

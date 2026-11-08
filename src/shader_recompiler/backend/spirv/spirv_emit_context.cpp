@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <climits>
@@ -974,6 +975,16 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         return;
     }
     using DefPtr = Id StorageDefinitions::*;
+    // Each helper scans every global storage buffer. Inlined at every call site, a compute shader
+    // with many global accesses takes NVIDIA's compiler seconds (Ocarina of Time: up to 7.6 s each).
+    // DontInline only with EDEN_NX2_SPIRV_INLINE_GLOBALS=0: it builds those shaders faster, but
+    // cost ~2.6 fps walking through Hyrule Field on an RTX 4080 (fresh launches, 55.2/55.3 vs
+    // 57.9/57.8 inlined), and a shader is built once before the driver's cache has it.
+    static const spv::FunctionControlMask function_control = [] {
+        const char* value = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
+        return value != nullptr && value[0] == '0' ? spv::FunctionControlMask::DontInline
+                                                   : spv::FunctionControlMask::MaskNone;
+    }();
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback) {
@@ -1062,7 +1073,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     }};
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
-        const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
+        const Id func_id{OpFunction(type, function_control, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         if (!profile.support_descriptor_aliasing && shift > 2) {
             AddLabel();
@@ -1106,7 +1117,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     }};
     const auto define_write{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(void_id, U64, type)};
-        const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
+        const Id func_id{OpFunction(void_id, function_control, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
         if (!profile.support_descriptor_aliasing && shift > 2) {
@@ -1201,8 +1212,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }
         const auto kind = static_cast<GlobalAtomic>(index);
         const Id type{kind == AddF32 ? F32[1] : U32[1]};
-        const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone,
-                                    TypeFunction(type, U64, type))};
+        const Id func_id{OpFunction(type, function_control, TypeFunction(type, U64, type))};
         const Id addr{OpFunctionParameter(U64)};
         const Id value{OpFunctionParameter(type)};
         define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
@@ -1242,8 +1252,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             });
         })) {
         const Id function_type{TypeFunction(U32[1], U64, U32[1], U32[1])};
-        atomic_cas_global_func_u32 =
-            OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type);
+        atomic_cas_global_func_u32 = OpFunction(U32[1], function_control, function_type);
         const Id address{OpFunctionParameter(U64)};
         const Id comparator{OpFunctionParameter(U32[1])};
         const Id value{OpFunctionParameter(U32[1])};

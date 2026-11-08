@@ -13,6 +13,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon::QueryDma {

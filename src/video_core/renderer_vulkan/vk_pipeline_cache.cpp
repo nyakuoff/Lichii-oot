@@ -40,8 +40,10 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
@@ -765,6 +767,20 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
     return used;
 }
 
+/// Keeps only the vertex attribute types the programs of `envs` read (dynamic vertex input keys).
+void MaskKeyedAttributeTypes(GraphicsPipelineCacheKey& key, std::span<const FileEnvironment> envs) {
+    std::array<u64, Maxwell::MaxShaderProgram> attribute_masks;
+    attribute_masks.fill(~u64{0});
+    size_t env_index = 0;
+    for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
+        if (key.unique_hashes[stage] != 0 && env_index < envs.size()) {
+            attribute_masks[stage] = VideoCommon::VertexAttributeMaskOf(envs[env_index++]);
+        }
+    }
+    key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+        key.state.attribute_types, key.unique_hashes, attribute_masks);
+}
+
 // Without a list of the pipelines recent sessions used (the first boot with this cache, or a session
 // that ended before saving it), this many cached graphics pipelines at most are built at boot and the
 // rest when first needed. A cache that grew over many builds held 48k pipelines, ~21 GB of driver
@@ -828,13 +844,28 @@ void PipelineCache::SaveUsedPipelines() {
     }
 }
 
-GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+void PipelineCache::RefreshGraphicsKey() {
+    if (!dynamic_features.has_dynamic_vertex_input) {
+        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+        return;
+    }
+    // Refresh only rewrites the types when the vertex input changes, so the masked copy in the
+    // key must not carry over to the next programs. Types of attributes the programs don't read
+    // would split their pipelines by whatever the game left in those registers (Ocarina of Time:
+    // up to 20 keys for the same shaders, each built again on the GPU thread).
+    graphics_key.state.attribute_types = vertex_attribute_types;
+    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    vertex_attribute_types = graphics_key.state.attribute_types;
+    graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+        vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
+}
 
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;
     }
-    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    RefreshGraphicsKey();
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
@@ -864,8 +895,9 @@ namespace {
 /// Which pointer slots a native program's arguments fill depends on the area (Ocarina of Time's
 /// foliage culling fills different list slots in Hyrule Field and Castle Town), so a translation
 /// rebuilt in one area may lack pointers the first cached one binds. Try first the translations
-/// that bind every pointer the first one binds, those binding the most first, then the others in
-/// cache order.
+/// that bind every pointer the first one binds, those binding the most first and the newest of
+/// those binding as many (an older one can be from a translator that asked about fewer slots, and
+/// fail), then the others in cache order.
 void OrderComputeTranslations(std::vector<FileEnvironment>& candidates) {
     if (candidates.size() < 2) {
         return;
@@ -885,7 +917,13 @@ void OrderComputeTranslations(std::vector<FileEnvironment>& candidates) {
         if (lhs_keeps != keeps_first(rhs)) {
             return lhs_keeps;
         }
-        return lhs_keeps && keys[lhs].size() > keys[rhs].size();
+        if (!lhs_keeps) {
+            return false;
+        }
+        if (keys[lhs].size() != keys[rhs].size()) {
+            return keys[lhs].size() > keys[rhs].size();
+        }
+        return lhs > rhs;
     });
     std::vector<FileEnvironment> ordered;
     ordered.reserve(candidates.size());
@@ -1019,6 +1057,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     size_t queued_graphics = 0;
     size_t restamped_pipelines = 0;
     size_t feature_mismatches = 0;
+    using GraphicsRecords = std::vector<std::vector<FileEnvironment>>;
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -1045,6 +1084,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // loading only ever adds entries (see OrderComputeTranslations), and take the next when a
     // translation fails.
     ::Common::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> compute_envs;
+    // The same for graphics: a pipeline whose record failed to load is stored again when the GPU
+    // thread builds it, and its records are tried newest first.
+    std::vector<std::pair<GraphicsPipelineCacheKey, GraphicsRecords>> graphics_records;
+    ::Common::unordered_map<GraphicsPipelineCacheKey, size_t> graphics_record_index;
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
@@ -1111,6 +1154,20 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
+        // Keys stored before they kept only the attribute types the programs read (and imported
+        // cache version 53 ones) are looked up masked. The pipeline is the same: a type is only
+        // dropped for an attribute no program reads. Records that now share a key are tried
+        // newest first, like those of a pipeline stored again.
+        if (key.state.dynamic_vertex_input != 0) {
+            const u64 stored_hash = key.DriverNeutralHash();
+            MaskKeyedAttributeTypes(key, envs);
+            if (const auto used = used_pipelines.find(stored_hash); used != used_pipelines.end()) {
+                const u8 age = used->second;
+                const auto [entry, inserted] = used_pipelines.try_emplace(key.DriverNeutralHash(), age);
+                entry->second = (std::min)(entry->second, age);
+            }
+        }
+
         const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
         if (key_requests_provoking_last && !dynamic_features.has_provoking_vertex_last_mode) {
             ++feature_mismatches;
@@ -1132,7 +1189,20 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             key.RestampDriver(dynamic_features.driver_id, dynamic_features.driver_version);
             ++restamped_pipelines;
         }
+        // Older used lists hold the full hash of the key as it was stored.
+        if (const auto used = used_pipelines.find(recorded_hash); used != used_pipelines.end()) {
+            const u8 age = used->second;
+            const auto [entry, inserted] = used_pipelines.try_emplace(key.DriverNeutralHash(), age);
+            entry->second = (std::min)(entry->second, age);
+        }
 
+        const auto [it, inserted] = graphics_record_index.try_emplace(key, graphics_records.size());
+        if (inserted) {
+            graphics_records.emplace_back(key, GraphicsRecords{});
+        }
+        graphics_records[it->second].second.push_back(std::move(envs));
+    }};
+    const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, GraphicsRecords records) {
         const u64 hash = key.Hash();
         if (!disk_pipelines.insert(hash).second) {
             return;
@@ -1142,23 +1212,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             (used_pipelines.empty()
                  ? queued_graphics >= MaxPipelinesWithoutUsedList
                  : !used_pipelines.contains(key.DriverNeutralHash()) &&
-                       !used_pipelines.contains(hash) && !used_pipelines.contains(recorded_hash))) {
+                       !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
-            size_t capture_bytes = (envs.capacity() - envs.size()) * sizeof(FileEnvironment);
-            for (const auto& env : envs) {
-                capture_bytes += env.MemorySize();
+            size_t capture_bytes = (records.capacity() - records.size()) * sizeof(records[0]);
+            for (const auto& envs : records) {
+                capture_bytes += (envs.capacity() - envs.size()) * sizeof(FileEnvironment);
+                for (const auto& env : envs) {
+                    capture_bytes += env.MemorySize();
+                }
             }
             if (background_pipelines.Add(
-                    key, capture_bytes, [this, key, envs = std::move(envs)]() mutable {
-                        ShaderPools pools;
-                        boost::container::static_vector<Shader::Environment*,
-                                                        Maxwell::MaxShaderProgram>
-                            env_ptrs;
-                        for (auto& env : envs) {
-                            env_ptrs.push_back(&env);
-                        }
-                        auto pipeline =
-                            CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
+                    key, capture_bytes, [this, key, records = std::move(records)]() mutable {
+                        auto pipeline = CreateCachedGraphicsPipeline(key, records, nullptr);
                         if (pipeline && pipeline->Failed()) {
                             return std::unique_ptr<GraphicsPipeline>{};
                         }
@@ -1170,14 +1235,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         ++queued_graphics;
 
-        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
-            ShaderPools pools;
-            boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
-            for (auto& env : envs_) {
-                env_ptrs.push_back(&env);
-            }
-            auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
-                                                 state.statistics.get(), false)};
+        workers.QueueWork([this, key, records_ = std::move(records), &state, &callback]() mutable {
+            auto pipeline{CreateCachedGraphicsPipeline(key, records_, state.statistics.get())};
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -1192,6 +1251,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
+    for (auto& [key, records] : graphics_records) {
+        std::ranges::reverse(records);
+        queue_graphics(key, std::move(records));
+    }
+    graphics_records.clear();
+    graphics_record_index.clear();
     for (auto& [key, candidates] : compute_envs) {
         OrderComputeTranslations(candidates);
         queue_compute(key, std::move(candidates));
@@ -1458,6 +1523,8 @@ void PipelineCache::EvictUnusedPipelines() {
     // its place is revisited (~10 ms). Ocarina of Time kept ~1,900 of them and evicted 3,400 in
     // 25 minutes of play, then rebuilt 1,850 (14 s of stalls, 3.8 s in one 10 s window). 8,000
     // pipelines are ~3.6 GB of driver memory at most. EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
+    // Past it only the excess goes, least recently used first (from zortos293/Lichii#408), so
+    // crossing it doesn't drop every stale pipeline at once.
     static const size_t evict_above = [] {
         const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE");
         return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
@@ -1467,16 +1534,13 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
-    const u64 tick = scheduler.CurrentTick();
     // ~0.9 GB of driver memory at ~0.45 MB each.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
     size_t kept_prebuilt = 0;
-    size_t evicted = 0;
-    for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
-        GraphicsPipeline* const pipeline = it->second.get();
-        if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
+    std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
+    for (const auto& [key, pipeline] : graphics_cache) {
+        if (pipeline == nullptr || pipeline.get() == current_pipeline || !pipeline->IsBuilt() ||
             pipeline->LastUse() >= cutoff) {
-            ++it;
             continue;
         }
         // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
@@ -1486,18 +1550,25 @@ void PipelineCache::EvictUnusedPipelines() {
         // large cache can't hold their driver memory for the whole session.
         if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
             ++kept_prebuilt;
-            ++it;
             continue;
         }
-        if (used_this_session.erase(pipeline) != 0) {
+        candidates.emplace_back(pipeline->LastUse(), key);
+    }
+    const size_t evicted = VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
+                                                                 candidates.size(), evict_above);
+    if (evicted == 0) {
+        return;
+    }
+    std::nth_element(candidates.begin(), candidates.begin() + (evicted - 1), candidates.end(),
+                     [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+    const u64 tick = scheduler.CurrentTick();
+    for (size_t i = 0; i < evicted; ++i) {
+        const auto it = graphics_cache.find(candidates[i].second);
+        if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.DriverNeutralHash());
         }
         evicted_pipelines.emplace_back(tick, std::move(it->second));
-        it = graphics_cache.erase(it);
-        ++evicted;
-    }
-    if (evicted == 0) {
-        return;
+        graphics_cache.erase(it);
     }
     for (auto& [key, pipeline] : graphics_cache) {
         if (pipeline) {
@@ -1600,6 +1671,42 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     return discard ? nullptr : pipeline;
 }
 
+namespace {
+/// "pipeline=<key hash> s<stage>:<shader hash> ...", as the runtime pipeline lines print them
+std::string PipelineShaders(const GraphicsPipelineCacheKey& key) {
+    std::string shaders = fmt::format("pipeline={:016x}", key.Hash());
+    for (size_t stage = 0; stage < key.unique_hashes.size(); ++stage) {
+        if (key.unique_hashes[stage] != 0) {
+            shaders += fmt::format(" s{}:{:016x}", stage, key.unique_hashes[stage]);
+        }
+    }
+    return shaders;
+}
+} // Anonymous namespace
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::CreateCachedGraphicsPipeline(
+    const GraphicsPipelineCacheKey& key, std::vector<std::vector<FileEnvironment>>& records,
+    PipelineStatistics* statistics) {
+    ShaderPools pools;
+    for (auto& envs : records) {
+        pools.ReleaseContents();
+        boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+        for (auto& env : envs) {
+            env_ptrs.push_back(&env);
+        }
+        if (auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), statistics, false)}) {
+            return pipeline;
+        }
+    }
+    // A pipeline that keeps failing however often it is stored again is not appended every session.
+    constexpr size_t MaxRecords = 3;
+    if (records.size() < MaxRecords) {
+        std::scoped_lock lock{failed_disk_pipelines_mutex};
+        failed_disk_pipelines.insert(key.Hash());
+    }
+    return nullptr;
+}
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
@@ -1688,6 +1795,25 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         if (programs[index].info.requires_layer_emulation) {
             layer_source_program = &programs[index];
+        }
+        if (key.state.dynamic_vertex_input != 0 &&
+            programs[index].stage == Shader::Stage::VertexB) {
+            // The key dropped the types of attributes outside the input map: such a read now gets
+            // the default value (EDEN_NX2_KEY_ALL_ATTRIBUTES=1 keeps every type).
+            const u64 attribute_mask = VideoCommon::VertexAttributeMaskOf(env);
+            for (size_t attribute = 0; attribute < Shader::IR::NUM_GENERICS; ++attribute) {
+                if (programs[index].info.loads.Generic(attribute) &&
+                    ((attribute_mask >> (attribute * 2)) & 3) == 0) {
+                    static std::atomic<u32> warned{};
+                    if (warned.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "Vertex program {:016x} reads attribute {} outside its input "
+                                    "map",
+                                    key.unique_hashes[index], attribute);
+                    }
+                    break;
+                }
+            }
         }
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
@@ -1991,7 +2117,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         env.Dump(hash, key.unique_hashes[index]);
     }
-    LOG_ERROR(Render_Vulkan, "{}", exception.what());
+    LOG_ERROR(Render_Vulkan, "Graphics pipeline compilation failed {}{}: {}", PipelineShaders(key),
+              build_in_parallel ? "" : " (disk cache)", exception.what());
     return nullptr;
 }
 
@@ -2038,13 +2165,7 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
-        std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
-        for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
-            if (graphics_key.unique_hashes[stage] != 0) {
-                shaders += fmt::format(" s{}:{:016x}", stage, graphics_key.unique_hashes[stage]);
-            }
-        }
-        ReportRuntimePipeline("Graphics", begin, shaders);
+        ReportRuntimePipeline("Graphics", begin, PipelineShaders(graphics_key));
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
@@ -2074,9 +2195,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         return pipeline;
     }
     if (disk_pipelines.contains(graphics_key.Hash())) {
-        // In the disk cache already, only not built at boot.
-        QueueVulkanPipelineCacheFlush();
-        return pipeline;
+        bool failed_to_load{};
+        {
+            std::scoped_lock lock{failed_disk_pipelines_mutex};
+            failed_to_load = failed_disk_pipelines.erase(graphics_key.Hash()) != 0;
+        }
+        if (!failed_to_load) {
+            // In the disk cache already, only not built at boot.
+            QueueVulkanPipelineCacheFlush();
+            return pipeline;
+        }
+        // Its records failed to load (see CreateCachedGraphicsPipeline): store this build after
+        // them, to be tried first from the next boot on.
     }
     disk_pipelines.insert(graphics_key.Hash());
     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {

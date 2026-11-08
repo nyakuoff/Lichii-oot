@@ -796,6 +796,36 @@ void PinCurrentThread(PinnedRole role) {
 #endif
 }
 
+u64 BackgroundWorkCpuMask() {
+    // The pin_gpu_threads planner hands out CPU sets (Windows) and CPU lists (Linux), not group 0
+    // masks, so background work isn't steered off the GPU threads' cores.
+    return 0;
+}
+
+void SetCurrentThreadCpuMask(u64 mask) {
+#ifdef _WIN32
+    if (mask == 0) {
+        DWORD_PTR process{};
+        DWORD_PTR system{};
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system) || process == 0) {
+            return;
+        }
+        mask = process;
+    }
+    SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask));
+#else
+    static_cast<void>(mask);
+#endif
+}
+
+void SetCurrentThreadIdlePriority() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+#else
+    SetCurrentThreadPriority(ThreadPriority::Low);
+#endif
+}
+
 void SetCurrentThreadToEfficiencyCores() {
 #if defined(__ANDROID__)
     if (ADPF::AddCurrentThread(ADPF::Session::Background)) {

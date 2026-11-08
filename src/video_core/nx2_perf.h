@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -44,5 +45,27 @@ inline std::atomic<long long> g_host_refresh_ns{0};
 /// frontends set it where the OS has no compositor timing query for the host frame pacer
 /// (Linux); EDEN_NX2_HOST_REFRESH_HZ overrides it.
 inline std::atomic<double> g_display_refresh_hz{0.0};
+/// At 30 FPS and below the host frame pacer presents frames as soon as they are rendered and
+/// publishes how long before the display's next refresh the last one was ready (ns), or -1
+/// while it isn't pacing that way. The game's present pacing (nx2_gsv.h) moves its frames until
+/// that is ~6 ms: each lands on a refresh with little wait (input lag) and evenly spaced.
+inline std::atomic<long long> g_host_phase_ns{-1};
+
+/// Host frame times: the interval between frames handed to the swapchain, counted in 0.25 ms
+/// buckets (the last holds 63.75 ms and up). The debug server's status returns the counts; the
+/// difference between two calls gives that window's percentiles (1% and 0.1% lows).
+inline constexpr size_t FrameTimeBuckets = 256;
+inline constexpr long long FrameTimeBucketNs = 250'000;
+inline std::array<std::atomic<unsigned long long>, FrameTimeBuckets> g_frame_times{};
+
+inline void NoteFrameTime(long long interval_ns) {
+    // Longer gaps are loading screens or a paused game, not frames.
+    if (interval_ns <= 0 || interval_ns > 1'000'000'000) {
+        return;
+    }
+    const auto bucket =
+        (std::min)(static_cast<size_t>(interval_ns / FrameTimeBucketNs), FrameTimeBuckets - 1);
+    g_frame_times[bucket].fetch_add(1, std::memory_order_relaxed);
+}
 
 } // namespace VideoCommon::Nx2Perf

@@ -9,6 +9,7 @@
 #include <span>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 
 #include <fmt/format.h>
 

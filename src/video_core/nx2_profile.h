@@ -139,7 +139,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DmaWaitCause::Count
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 10> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DmaWaitCause::Count)> dma_wait_causes{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
@@ -231,6 +231,8 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    UboInPlaceSame, ///< EDEN_NX2_UBO_INPLACE: small uniform buffers unchanged, nothing copied
+    UboInPlaceChanged, ///< EDEN_NX2_UBO_INPLACE: small uniform buffers changed, copied once
 };
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
@@ -356,6 +358,11 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    if (data.counters[8] != 0 || data.counters[9] != 0) {
+        line += fmt::format(" | uniform buffers compared in place {:.0f} unchanged, {:.0f} changed",
+                            static_cast<double>(data.counters[8]) * 1e9 / window,
+                            static_cast<double>(data.counters[9]) * 1e9 / window);
+    }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {

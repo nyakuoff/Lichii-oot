@@ -116,6 +116,8 @@ public:
         VkBuffer host;
         u32 host_offset;
         std::vector<u8> guest;
+        /// EDEN_NX2_FRAME_DUMP_HOST: also read the host buffer the draw reads ("host_copy").
+        bool also_host{};
     };
 
     explicit FrameDump(const Device& device, MemoryAllocator& memory_allocator,

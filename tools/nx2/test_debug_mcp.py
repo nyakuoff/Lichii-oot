@@ -101,7 +101,7 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(names, ["status", "frame_times", "screenshot", "log_tail", "log_filter", "capture_frame",
                              "capture_image", "reject_shaders", "sample", "timeline", "read_memory",
                                  "search_memory", "read_gpu_memory", "input",
-                                 "input_sequence"])
+                                 "input_sequence", "input_record", "input_replay"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 
     def test_frame_times_is_forwarded(self):
@@ -139,6 +139,7 @@ class AdapterTest(unittest.TestCase):
         sequence = {"steps": [{"frames": 300}, {"frames": 300, "buttons": ["A"]}]}
         self.assertEqual(debug_mcp.default_timeout("input_sequence", sequence), 40)
         self.assertEqual(debug_mcp.default_timeout("status", {}), 5)
+        self.assertEqual(debug_mcp.default_timeout("input_replay", {"path": "a.json"}), 86400)
         result = self.call("input_sequence", sequence)
         self.assertFalse(result["isError"])
         self.assertEqual(self.fake.requests[-1]["params"], sequence)

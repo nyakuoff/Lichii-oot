@@ -495,6 +495,23 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
         }
         recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
     }
+    for (const BoundBuffer& buffer : buffers) {
+        if (!buffer.also_host || buffer.host == VK_NULL_HANDLE) {
+            continue;
+        }
+        const size_t program = compute ? 0 : buffer.stage + 1;
+        const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        const std::string owner =
+            compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
+                    : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
+        recorded |= RecordBuffer(
+            buffer.host, buffer.host_offset, buffer.size,
+            fmt::format(
+                R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"host_copy")",
+                owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform", buffer.index,
+                buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
+                buffer.gpu_modified));
+    }
     return recorded;
 }
 

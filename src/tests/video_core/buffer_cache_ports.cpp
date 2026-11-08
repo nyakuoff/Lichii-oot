@@ -229,9 +229,8 @@ struct BufferCacheTestAccess {
         channel.uniform_buffers[0][0] = {.device_addr = address, .size = size, .buffer_id = id};
         cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
     }
-    static void NextFrame(Cache& cache) {
-        cache.native_indirect_uniforms_this_frame.clear();
-    }
+    // Banks are checked on every bind now; kept so the tests read as before.
+    static void NextFrame(Cache&) {}
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;
     }

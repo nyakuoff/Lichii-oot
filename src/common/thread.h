@@ -109,6 +109,13 @@ void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();
 
+/// Windows: the processor group 0 logical processors background work should use to stay off the
+/// cores pinned to the GPU threads. 0 while nothing is pinned, and elsewhere.
+[[nodiscard]] u64 BackgroundWorkCpuMask();
+/// Windows: hard affinity to `mask` (group 0), or with 0 to every CPU the process may use.
+void SetCurrentThreadCpuMask(u64 mask);
+/// THREAD_PRIORITY_IDLE on Windows, ThreadPriority::Low elsewhere.
+void SetCurrentThreadIdlePriority();
 void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();

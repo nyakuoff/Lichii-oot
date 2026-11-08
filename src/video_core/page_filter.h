@@ -14,11 +14,13 @@ namespace VideoCommon {
 /// The 4 KiB device pages a cache has ever registered objects on. Bits are never cleared, so a
 /// clear bit proves the cache holds nothing there and an invalidation of those pages does nothing.
 /// Ranges past the 36-bit space aren't tracked: Any reports them as possibly holding objects
-/// (such as stand-in addresses of images without CPU backing).
+/// (such as stand-in addresses of images without CPU backing), and so does every range once such a
+/// range was marked.
 class PageFilter {
 public:
     PageFilter() : words{std::make_unique<std::atomic<u64>[]>(NumWords)} {}
 
+    /// Records that the cache holds objects on [address, address + size).
     void Mark(u64 address, u64 size) {
         if (size == 0) {
             return;
@@ -26,6 +28,7 @@ public:
         const u64 first = address >> PageBits;
         const u64 last = (address + size - 1) >> PageBits;
         if (last >= NumWords * 64) {
+            overflow.store(true, std::memory_order_relaxed);
             return;
         }
         for (u64 page = first; page <= last;) {
@@ -47,7 +50,7 @@ public:
         }
         const u64 first = address >> PageBits;
         const u64 last = (address + size - 1) >> PageBits;
-        if (last >= NumWords * 64) {
+        if (last >= NumWords * 64 || overflow.load(std::memory_order_relaxed)) {
             return true;
         }
         for (u64 page = first; page <= last;) {
@@ -66,6 +69,7 @@ private:
     static constexpr u64 PageBits = 12;
     static constexpr u64 NumWords = (u64{1} << (36 - PageBits)) / 64; // 2 MiB of bits
     std::unique_ptr<std::atomic<u64>[]> words;
+    std::atomic<bool> overflow{};
 };
 
 } // namespace VideoCommon
