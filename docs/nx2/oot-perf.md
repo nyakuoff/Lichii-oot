@@ -1301,3 +1301,28 @@ Not pushed: fsr/oot, amd/oot, oot-1080p, flash/oot (gh token lacks `workflow` sc
 - Pushing works with `git -c credential.helper= -c 'credential.helper=!gh auth git-credential'`;
   the gh token now has `workflow` scope, and fsr/oot, amd/oot, oot-1080p, flash/oot, oot-perf are
   on origin (the earlier "Not pushed" note is resolved).
+
+## 2026-11-08: Fritchii v4.1 merged and installed (f6b00ef0f5)
+
+fritchii/oot = fsr/oot cd4f727816 + zortos/nx2 aae0b063f7 (0e96c44476: 28 commits, #591, #700,
+#714, #718, #721; VulkanPipelineCacheVersion 53 -> 54, kept zortos's vulkan.fork-v54.bin naming)
++ Fritchii v4.1 f6d42b8715 (139ced1674) + f6b00ef0f5 (native uniform bank test follows Fritchii's
+per-page check). Fritchii's frizti_settings (qt-config rewrite, revision 3) compiles but is not
+called; settings defaults unchanged from fsr/oot. Branding and `-branch` GIT_DESC kept. Pushed.
+Runs (slot 2, cache-v54pack, BOOT_FRAME 2000, harness):
+- native 55.66 fps median/p95/p99 17.31/21.61/36.61, 7 hitches >33 ms, boot pipelines 21816;
+  FSR 3.1 56.49 fps 16.90/21.82/37.45, 9 hitches, FSR evaluated 15x, no fallbacks.
+- cd4f727816 reference, same harness/cache: 54.81 fps 17.82/21.19/35.86, 8 hitches, 19498.
+- ctest 957/958: global_memory_coherence.cpp:430 fails only in the suite, passes alone; from
+  Fritchii-only 617a3a359c.
+Owner install: lichii-1080p/build/bin/lichii = f6b00ef0f5-fritchii/oot (418850280 B);
+rollback lichii-before-fritchii-20261108 = cd4f727816 (415888488 B). 50k-pipeline v54 pack in
+~/.cache/eden/shader/0400486024dec000/ (vulkan.fork-v54.bin 2545111501 B + used file); v53 files
+left as rollback.
+Boot stall (investigated first, not a code regression): with the ultrawide IPS mods
+"Edge-to-Edge Ultrawide HUD v0.1 (3440x1440)" and "Ultrawide 21x9 (3440x1440)" applied, the guest
+spins before its first present on every build tried (f6b00ef0f5, 0e96c44476, zortos tip
+aae0b063f7, and cd4f727816), with docked off and on, v53 and v54 caches, HOST_PACE/SPLIT off.
+DKB_QUERY stops at 41 and no TickFrame/Composite appears; the GPU thread idles in
+PopQueue::PopWait with every CPUCore in JIT code. With the two mod dirs removed the same binaries
+present (992 frames in 110 s). The GUI install boots the guest with the mods but never presents.
